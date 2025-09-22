@@ -37,6 +37,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <uk/essentials.h>
 #include <uk/process.h>
 #include <uk/print.h>
 #include <uk/syscall.h>
@@ -118,15 +119,6 @@ int execle(const char *path, const char *arg, ...
 	va_end(args);
 	errno = ENOSYS;
 	return -1;
-}
-
-UK_SYSCALL_R_DEFINE(int, execve, const char *, path,
-		    char *const *, argv, char *const *, envp)
-{
-	uk_pr_warn("%s(): path=%s\n", __func__, path);
-	exec_warn_argv(argv);
-	exec_warn_envp(envp);
-	return -ENOSYS;
 }
 
 int execv(const char *path, char *const argv[])
@@ -311,8 +303,8 @@ UK_SYSCALL_R_DEFINE(int, prctl, int, option,
 	return 0; /* syscall has no effect */
 }
 
-UK_LLSYSCALL_R_DEFINE(int, prlimit64, int, pid, unsigned int, resource,
-		      struct rlimit *, new_limit, struct rlimit *, old_limit)
+int uk_sys_prlimit64(int pid, unsigned int resource,
+		     struct rlimit *new_limit, struct rlimit *old_limit)
 {
 	if (unlikely(pid != 0))
 		uk_pr_debug("Do not support prlimit64 on PID %u, use current process\n",
@@ -383,16 +375,20 @@ UK_LLSYSCALL_R_DEFINE(int, prlimit64, int, pid, unsigned int, resource,
 	return 0;
 }
 
+UK_LLSYSCALL_R_DEFINE(int, prlimit64, int, pid, unsigned int, resource,
+		      struct rlimit *, new_limit, struct rlimit *, old_limit)
+{
+	return uk_sys_prlimit64(pid, resource, new_limit, old_limit);
+}
+
 UK_SYSCALL_R_DEFINE(int, getrlimit, int, resource, struct rlimit *, rlim)
 {
-	return uk_syscall_r_prlimit64(0, (long) resource,
-				      (long) NULL, (long) rlim);
+	return uk_sys_getrlimit(resource, rlim);
 }
 
 UK_SYSCALL_R_DEFINE(int, setrlimit, int, resource, const struct rlimit *, rlim)
 {
-	return uk_syscall_r_prlimit64(0, (long) resource,
-				      (long) rlim, (long) NULL);
+	return uk_sys_setrlimit(resource, rlim);
 }
 
 UK_SYSCALL_R_DEFINE(int, getrusage, int, who,

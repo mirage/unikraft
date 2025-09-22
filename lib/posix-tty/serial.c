@@ -88,19 +88,19 @@ static inline __ssz _console_out(const char *buf, __sz len)
 }
 
 static ssize_t serial_read(const struct uk_file *f,
-			   const struct iovec *iov, int iovcnt,
-			   off_t off, long flags __unused)
+			   const struct iovec *iov, size_t iovcnt,
+			   size_t off, long flags __unused)
 {
 	ssize_t total = 0;
 
 	UK_ASSERT(f->vol == SERIAL_VOLID);
-	if (unlikely(off != 0))
-		return -EINVAL;
+	if (unlikely(off))
+		return -ESPIPE;
 
 	if (!uk_file_poll_immediate(f, UKFD_POLLIN))
 		return 0;
 
-	for (int i = 0; i < iovcnt; i++) {
+	for (size_t i = 0; i < iovcnt; i++) {
 		char *buf = iov[i].iov_base;
 		size_t len = iov[i].iov_len;
 		char *last;
@@ -137,16 +137,16 @@ static ssize_t serial_read(const struct uk_file *f,
 }
 
 static ssize_t serial_write(const struct uk_file *f __maybe_unused,
-			    const struct iovec *iov, int iovcnt,
-			    off_t off, long flags __unused)
+			    const struct iovec *iov, size_t iovcnt,
+			    size_t off, long flags __unused)
 {
 	ssize_t total = 0;
 
 	UK_ASSERT(f->vol == SERIAL_VOLID);
-	if (unlikely(off != 0))
-		return -EINVAL;
+	if (unlikely(off))
+		return -ESPIPE;
 
-	for (int i = 0; i < iovcnt; i++) {
+	for (size_t i = 0; i < iovcnt; i++) {
 		char *buf = iov[i].iov_base;
 		size_t len = iov[i].iov_len;
 		int bytes_written;
@@ -259,6 +259,7 @@ static int serial_getstat(const struct uk_file *f __maybe_unused,
 static const struct uk_file_ops serial_ops = {
 	.read = serial_read,
 	.write = serial_write,
+	.mem = uk_file_nop_mem,
 	.getstat = serial_getstat,
 	.setstat = uk_file_nop_setstat,
 	.ctl = serial_ctl,
@@ -269,7 +270,7 @@ static uk_file_refcnt serial_ref = UK_FILE_REFCNT_INITIALIZER(serial_ref);
 static struct uk_file_state serial_state = UK_FILE_STATE_EVENTS_INITIALIZER(
 	serial_state, UKFD_POLLIN|UKFD_POLLOUT);
 
-static const struct uk_file serial_file = {
+const struct uk_file uk_file_serial = {
 	.vol = SERIAL_VOLID,
 	.node = NULL,
 	.ops = &serial_ops,
@@ -277,11 +278,3 @@ static const struct uk_file serial_file = {
 	.state = &serial_state,
 	._release = uk_file_static_release
 };
-
-const struct uk_file *uk_serialfile_create(void)
-{
-	const struct uk_file *f = &serial_file;
-
-	uk_file_acquire(f);
-	return f;
-}

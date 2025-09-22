@@ -11,12 +11,18 @@
 #include <uk/file/nops.h>
 #include <uk/posix-eventfd.h>
 #include <uk/posix-fd.h>
+
+#if CONFIG_LIBPOSIX_FDTAB
 #include <uk/posix-fdtab.h>
 #include <uk/syscall.h>
+#endif /* CONFIG_LIBPOSIX_FDTAB */
 
 
 static const char EVENTFD_VOLID[] = "eventfd_vol";
 static const char EVENTFD_SEM_VOLID[] = "eventfd_semaphore_vol";
+
+#define EVENTFD_FNAME "eventfd"
+#define EVENTFD_FNAME_LEN (sizeof(EVENTFD_FNAME) - 1)
 
 #define _IS_EVFVOL(v) ((v) == EVENTFD_VOLID || (v) == EVENTFD_SEM_VOLID)
 
@@ -32,8 +38,8 @@ struct evfd_alloc {
 
 
 static ssize_t evfd_read(const struct uk_file *f,
-			 const struct iovec *iov, int iovcnt,
-			 off_t off, long flags __unused)
+			 const struct iovec *iov, size_t iovcnt,
+			 size_t off, long flags __unused)
 {
 	int semaphore;
 	evfd_node n;
@@ -72,8 +78,8 @@ static ssize_t evfd_read(const struct uk_file *f,
 
 
 static ssize_t evfd_write(const struct uk_file *f,
-			  const struct iovec *iov, int iovcnt,
-			  off_t off, long flags __unused)
+			  const struct iovec *iov, size_t iovcnt,
+			  size_t off, long flags __unused)
 {
 	uint64_t add;
 	evfd_node n;
@@ -106,6 +112,7 @@ static ssize_t evfd_write(const struct uk_file *f,
 static const struct uk_file_ops evfd_ops = {
 	.read = evfd_read,
 	.write = evfd_write,
+	.mem = uk_file_nop_mem,
 	.getstat = uk_file_nop_getstat,
 	.setstat = uk_file_nop_setstat,
 	.ctl = uk_file_nop_ctl
@@ -153,6 +160,7 @@ struct uk_file *uk_eventfile_create(unsigned int count, int flags)
 	return &al->f;
 }
 
+#if CONFIG_LIBPOSIX_FDTAB
 int uk_sys_eventfd(unsigned int count, int flags)
 {
 	int ret;
@@ -167,7 +175,7 @@ int uk_sys_eventfd(unsigned int count, int flags)
 		mode |= O_NONBLOCK;
 	if (flags & EFD_CLOEXEC)
 		mode |= O_CLOEXEC;
-	ret = uk_fdtab_open(evf, mode);
+	ret = uk_fdtab_open_named(evf, mode, EVENTFD_FNAME, EVENTFD_FNAME_LEN);
 	uk_file_release(evf);
 	return ret;
 }
@@ -182,3 +190,4 @@ UK_SYSCALL_R_DEFINE(int, eventfd2, unsigned int, count, int, flags)
 {
 	return uk_sys_eventfd(count, flags);
 }
+#endif /* CONFIG_LIBPOSIX_FDTAB */

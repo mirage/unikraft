@@ -230,14 +230,14 @@ void *unix_socket_create(struct posix_socket_driver *d,
 }
 
 static
-void unix_socket_poll(posix_sock *file)
+void unix_socket_poll_setup(posix_sock *file)
 {
 	struct unix_sock_data *data = posix_sock_get_data(file);
 	struct uk_pollq *sockq = &file->state->pollq;
 
 	if (data->rpipe) {
 		UK_ASSERT(!(data->flags & UNIXSOCK_RDEV));
-		data->rio = UK_POLL_CHAIN_UPDATE(UKFD_POLLIN, sockq, 0);
+		data->rio = UK_POLL_CHAIN_UPDATE(UKFD_POLLIN, sockq);
 		data->rerr = UK_POLL_CHAIN_CALLBACK(EPOLLHUP,
 			unix_sock_rdown, sockq);
 		posix_sock_event_set(
@@ -251,8 +251,7 @@ void unix_socket_poll(posix_sock *file)
 	if (_SOCK_CONNECTION(data->type)) {
 		if (data->wpipe) {
 			UK_ASSERT(!(data->flags & UNIXSOCK_WREV));
-			data->wio = UK_POLL_CHAIN_UPDATE(UKFD_POLLOUT,
-				sockq, 0);
+			data->wio = UK_POLL_CHAIN_UPDATE(UKFD_POLLOUT, sockq);
 			data->werr = UK_POLL_CHAIN_CALLBACK(EPOLLERR,
 				unix_sock_wdown, sockq);
 			posix_sock_event_set(
@@ -394,7 +393,8 @@ void *unix_socket_accept4(posix_sock *file,
 	acc->remote = data->listen.q[i].remote;
 	acc->flags |= UNIXSOCK_CONN;
 
-	unix_sock_remotename(acc->remote, addr, addr_len);
+	if (addr)
+		unix_sock_remotename(acc->remote, addr, addr_len);
 	return acc;
 }
 
@@ -628,7 +628,7 @@ int unix_sock_connect_stream(posix_sock *file, posix_sock *target)
 	data->remote = target;
 	data->flags |= UNIXSOCK_CONN;
 	/* Poll self (to register events & mark connected) */
-	unix_socket_poll(file);
+	unix_socket_poll_setup(file);
 
 	return 0;
 
@@ -887,7 +887,7 @@ ssize_t unix_socket_sendto(posix_sock *file, const void *buf,
 
 static
 ssize_t unix_socket_read(posix_sock *file,
-			 const struct iovec *iov, int iovcnt)
+			 const struct iovec *iov, size_t iovcnt)
 {
 	struct msghdr msg = {
 		.msg_name = NULL,
@@ -903,7 +903,7 @@ ssize_t unix_socket_read(posix_sock *file,
 
 static
 ssize_t unix_socket_write(posix_sock *file,
-			  const struct iovec *iov, int iovcnt)
+			  const struct iovec *iov, size_t iovcnt)
 {
 	struct msghdr msg = {
 		.msg_name = NULL,
@@ -1032,7 +1032,7 @@ static struct posix_socket_ops unix_posix_socket_ops = {
 	.write		= unix_socket_write,
 	.close		= unix_socket_close,
 	.ioctl		= unix_socket_ioctl,
-	.poll		= unix_socket_poll,
+	.poll_setup	= unix_socket_poll_setup,
 };
 
 POSIX_SOCKET_FAMILY_REGISTER(AF_UNIX, &unix_posix_socket_ops);

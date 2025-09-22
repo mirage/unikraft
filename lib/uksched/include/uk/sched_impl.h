@@ -109,19 +109,26 @@ void uk_sched_thread_switch(struct uk_thread *next)
 	ukplat_per_lcpu_current(__uk_sched_thread_current) = next;
 
 	prev->tlsp = ukplat_tlsp_get();
-	if (prev->ectx)
-		ukarch_ectx_store(prev->ectx);
 
 	/* Load next TLS and extended registers before context switch.
 	 * This avoids requiring special initialization code for newly
 	 * created threads to do the loading.
 	 */
 	ukplat_tlsp_set(next->tlsp);
-	if (next->ectx)
-		ukarch_ectx_load(next->ectx);
 
 	ukplat_lcpu_set_auxsp(next->auxsp);
 
+	/**
+	 * NOTE: There is also prev->ectx/next->ectx! Since we only have
+	 * cooperative scheduling at the moment, saving/restoring ECTX
+	 * when thread switching is not necessary, since the ABI treats these
+	 * registers as scratch registers and thread switching essentially
+	 * happens through actual explicit function calls.
+	 * On the other hand, this is obviously not the case with preemptive
+	 * scheduling since thread switching can happen out of the blue,
+	 * typically on a timer IRQ, so then ECTX saving/restoring is definetely
+	 * necessary.
+	 */
 	ukarch_ctx_switch(&prev->ctx, &next->ctx);
 }
 

@@ -26,8 +26,14 @@
 #include <uk/arch/limits.h> /* for __PAGE_SIZE */
 #include <uk/plat/common/common.lds.h>
 
+#define BASE_ADDR 0x100000
+
 PHDRS
 {
+#if CONFIG_ELF_PHDRS_IN_PT_LOAD
+	phdrs PT_PHDR PHDRS;
+	headers PT_LOAD PHDRS FILEHDR FLAGS(PHDRS_PF_R);
+#endif /* CONFIG_ELF_PHDRS_IN_PT_LOAD */
 	text PT_LOAD FLAGS(PHDRS_PF_RX);
 	rodata PT_LOAD FLAGS(PHDRS_PF_R);
 	data PT_LOAD;
@@ -38,17 +44,33 @@ PHDRS
 
 SECTIONS
 {
-	. = 0x100000;
+#if CONFIG_ELF_PHDRS_IN_PT_LOAD
+	PROVIDE(__executable_start = BASE_ADDR);
+	. = BASE_ADDR + SIZEOF_HEADERS;
+	PROVIDE(__phdr = .);
+#endif /* CONFIG_ELF_PHDRS_IN_PT_LOAD */
 
-	_base_addr = .;		/* Symbol to represent the load base address */
+	. = BASE_ADDR;
+	_base_addr = BASE_ADDR;	/* Symbol to represent the load base address */
+
+#if CONFIG_ELF_PHDRS_IN_PT_LOAD
+	.headers :
+	{
+		/* prevent linker gc from removing multiboot header */
+		KEEP (*(.data.boot))
+		KEEP (*(.data.boot.*))
+	} :headers
+#endif /* CONFIG_ELF_PHDRS_IN_PT_LOAD */
 
 	/* Code */
 	_text = .;
 	.text :
 	{
+#if !CONFIG_ELF_PHDRS_IN_PT_LOAD
 		/* prevent linker gc from removing multiboot header */
 		KEEP (*(.data.boot))
 		KEEP (*(.data.boot.*))
+#endif /* !CONFIG_ELF_PHDRS_IN_PT_LOAD */
 		*(.text.boot)
 		*(.text.boot.*)
 

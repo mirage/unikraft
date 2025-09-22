@@ -3,7 +3,7 @@
 
 #include <uk/config.h>
 
-#if CONFIG_LIBVFSCORE
+#if CONFIG_LIBVFSCORE || CONFIG_LIBPOSIX_VFS
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,9 +18,13 @@ struct utimbuf {
 	time_t modtime;
 };
 
+#if CONFIG_HAVE_VFS
+
 int utime (const char *, const struct utimbuf *);
 
-#endif /* CONFIG_LIBVFSCORE */
+#endif /* CONFIG_HAVE_VFS */
+
+#endif /* CONFIG_LIBVFSCORE || CONFIG_LIBPOSIX_VFS */
 
 #ifdef __cplusplus
 }

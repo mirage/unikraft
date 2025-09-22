@@ -213,6 +213,7 @@ UK_CTASSERT(__offsetof(struct ukarch_auxspcb, uksysctx) ==
 typedef void (*ukarch_ctx_entry0)(void) __noreturn;
 typedef void (*ukarch_ctx_entry1)(long) __noreturn;
 typedef void (*ukarch_ctx_entry2)(long, long) __noreturn;
+typedef void (*ukarch_ctx_entry3)(long, long, long) __noreturn;
 
 /**
  * Initializes a context struct with stack pointer and
@@ -338,6 +339,59 @@ void ukarch_ctx_init_entry2(struct ukarch_ctx *ctx,
  *   Reference to context that shall be executed
  */
 void ukarch_ctx_switch(struct ukarch_ctx *store, struct ukarch_ctx *load);
+
+/**
+ * Without saving or restoring anything, directly switch to stack pointer
+ * and jump to instruction pointer stored in the context structure.
+ *
+ * @param ctx
+ *   Reference to context that shall be executed
+ */
+void ukarch_ctx_jump(struct ukarch_ctx *ctx) __noreturn;
+
+/**
+ * Function that can be executed in a context where one can take
+ * exceptions or yield the current thread.
+ * After the function returns, execution will resume the state stored in
+ * the execenv argument.
+ *
+ * @param execenv
+ *   Pointer to the execution environment that the function will return to
+ * @param arg
+ *   Custom user-defined argument
+ */
+typedef void (*ukarch_ehtrampo_entry)(struct ukarch_execenv *execenv, long arg);
+
+/**
+ * Initializes a context that allows jumping from an exception handling
+ * context to a caller-defined function in a context where one can take
+ * exceptions or yield the current thread.
+ * Returning from the caller-defined function resumes execution from
+ * the place that the exception handler would resume from.
+ *
+ * After calling ukarch_ehtrampo_init() use ukarch_ctx_jmp() to jump to
+ * the target context.
+ *
+ * NOTE: This function may return with a tainted extended context.
+ *
+ * @param ctx
+ *   Reference to context to initialize
+ * @param sp
+ *   Stack pointer (required and must be aligned to `UKARCH_EXECENV_END_ALIGN`)
+ *  The stack must have enough space to store both an entire execution
+ *  environment context as well as run the user provided entry function
+ * @param r
+ *   Pointer to architecture specific general purpose registers saved on
+ *  exception handling entry
+ * @param entry
+ *   Entry function to execute (required).
+ * @param arg
+ *   The argument `entry` callback will receive
+ */
+void ukarch_ctx_init_ehtrampo(struct ukarch_ctx *ctx,
+			      struct __regs *r,
+			      __uptr sp,
+			      ukarch_ehtrampo_entry entry, long arg);
 
 /**
  * Initialize an auxiliary stack pointer. This must be always called the
@@ -526,7 +580,6 @@ void ukarch_ectx_load(struct ukarch_ectx *state);
  */
 void ukarch_execenv_load(long state) __noreturn;
 
-#ifdef CONFIG_ARCH_X86_64
 /**
  * Compare the given extended context with the state of the currently executing
  * CPU. If the state is different, crash the kernel.
@@ -535,7 +588,6 @@ void ukarch_execenv_load(long state) __noreturn;
  *   Reference to extended context to compare to
  */
 void ukarch_ectx_assert_equal(struct ukarch_ectx *state);
-#endif
 
 #endif /* !__ASSEMBLY__ */
 #endif /* __UKARCH_CTX_H__ */

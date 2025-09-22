@@ -4,6 +4,8 @@ config HAVE_INTCTLR
 config LIBUKINTCTLR
 	bool "ukintctlr: Interrupt Controller API"
 	depends on HAVE_INTCTLR
+	select LIBUKATOMIC
+	select LIBUKBITOPS
 
 if LIBUKINTCTLR
 
@@ -13,6 +15,5 @@ config LIBUKINTCTLR_MAX_HANDLERS_PER_IRQ
 
 config LIBUKINTCTLR_ISR_ECTX_ASSERTIONS
 	bool "Check for unmodified ECTX in interrupt handlers"
-	depends on ARCH_X86_64
 
 endif

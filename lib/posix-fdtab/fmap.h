@@ -14,7 +14,7 @@
 #include <uk/atomic.h>
 #include <uk/assert.h>
 #include <uk/bitops.h>
-#include <uk/bitmap.h>
+#include <uk/bitops/bitmap.h>
 #include <uk/essentials.h>
 #include <uk/thread.h>
 
@@ -28,6 +28,8 @@ struct uk_bmap {
 	size_t size;
 };
 
+#define UK_BMAP_NELEM(s) UK_BITS_TO_LONGS(s)
+
 /**
  * Gets the size of the bitmap in bytes.
  *
@@ -36,7 +38,7 @@ struct uk_bmap {
  * @return
  *   Size of the bitmap in bytes
  */
-#define UK_BMAP_SZ(s) (UK_BITS_TO_LONGS(s) * sizeof(unsigned long))
+#define UK_BMAP_SZ(s) (UK_BMAP_NELEM(s) * sizeof(unsigned long))
 
 
 /**
@@ -182,6 +184,23 @@ static inline void uk_fmap_init(const struct uk_fmap *m)
 {
 	memset((void *)m->map, 0, m->bmap.size * sizeof(void *));
 	uk_bmap_init(&m->bmap);
+}
+
+/**
+ * Sets the value at `idx` to `p`.
+ *
+ * WARNING: This function is not thread-safe, take care when calling.
+ */
+static inline void uk_fmap_set(const struct uk_fmap *m, int idx, const void *p)
+{
+	if (!_FMAP_INRANGE(m, idx))
+		return;
+
+	if (p)
+		uk_bmap_reserve(&m->bmap, idx);
+	else
+		uk_bmap_free(&m->bmap, idx);
+	m->map[idx] = (void *)p;
 }
 
 /**
@@ -366,6 +385,7 @@ int uk_fmap_xchg(const struct uk_fmap *m, int idx,
 {
 	void *got;
 
+	UK_ASSERT(p); /* Cannot exchange with NULL, use uk_fmap_take instead */
 	if (!_FMAP_INRANGE(m, idx))
 		return -1;
 

@@ -14,12 +14,16 @@
 extern const struct uk_file_ops uk_file_nops;
 
 ssize_t uk_file_nop_read(const struct uk_file *f,
-			 const struct iovec *iov, int iovcnt,
-			 off_t off, long flags);
+			 const struct iovec *iov, size_t iovcnt,
+			 size_t off, long flags);
 
 ssize_t uk_file_nop_write(const struct uk_file *f,
-			  const struct iovec *iov, int iovcnt,
-			  off_t off, long flags);
+			  const struct iovec *iov, size_t iovcnt,
+			  size_t off, long flags);
+
+ssize_t uk_file_nop_mem(const struct uk_file *f, enum uk_file_mem_op op,
+			size_t off, size_t len,
+			struct iovec *iov, size_t iovcnt);
 
 int uk_file_nop_getstat(const struct uk_file *f,
 			unsigned int mask, struct uk_statx *arg);

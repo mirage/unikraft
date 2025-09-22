@@ -41,7 +41,7 @@
 #include <xen/hvm/hvm_op.h>
 #include <uk/arch/lcpu.h>
 #include <uk/atomic.h>
-#include <uk/bitops.h>
+#include <uk/bitops/bitscan.h>
 
 #define active_evtchns(sh, idx)				\
 	((sh)->evtchn_pending[idx] & ~(sh)->evtchn_mask[idx])
@@ -66,11 +66,11 @@ void do_hypervisor_callback(struct __regs *regs)
 #endif
 	l1 = uk_exchange_n(&vcpu_info->evtchn_pending_sel, 0);
 	while (l1 != 0) {
-		l1i = uk_ffsl(l1);
+		l1i = uk_lssbl(l1);
 		l1 &= ~(1UL << l1i);
 
 		while ((l2 = active_evtchns(s, l1i)) != 0) {
-			l2i = uk_ffsl(l2);
+			l2i = uk_lssbl(l2);
 			l2 &= ~(1UL << l2i);
 
 			port = (l1i * (sizeof(unsigned long) * 8)) + l2i;

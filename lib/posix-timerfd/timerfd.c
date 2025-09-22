@@ -13,20 +13,26 @@
 #include <uk/errptr.h>
 #include <uk/file/nops.h>
 #include <uk/posix-fd.h>
-#include <uk/posix-fdtab.h>
 #include <uk/posix-time.h>
 #include <uk/posix-timerfd.h>
 #include <uk/sched.h>
 #include <uk/timeutil.h>
+
+#if CONFIG_LIBPOSIX_FDTAB
+#include <uk/posix-fdtab.h>
 #include <uk/syscall.h>
+#endif /* CONFIG_LIBPOSIX_FDTAB */
 
 
 static const char TIMERFD_VOLID[] = "timerfd_vol";
 
+#define TIMERFD_FNAME "timerfd"
+#define TIMERFD_FNAME_LEN (sizeof(TIMERFD_FNAME) - 1)
 
 struct timerfd_node {
 	struct itimerspec set;
 	__u64 val;
+	__u64 total;
 	clockid_t clkid;
 	struct uk_thread *upthread;
 };
@@ -97,12 +103,11 @@ static __nsec _timerfd_update(const struct uk_file *f)
 	deadline = now + st.next;
 
 	/* Update val & events */
-	if (st.exp != d->val) {
-		d->val = st.exp;
-		if (st.exp)
-			uk_file_event_set(f, UKFD_POLLIN);
-		else
-			uk_file_event_clear(f, UKFD_POLLIN);
+	UK_ASSERT(st.exp >= d->total);
+	if (st.exp > d->total) {
+		d->val += st.exp - d->total;
+		d->total = st.exp;
+		uk_file_event_set(f, UKFD_POLLIN);
 	}
 	return deadline;
 }
@@ -119,6 +124,7 @@ static void _timerfd_set(struct timerfd_node *d, const struct itimerspec *set)
 		/* Arm */
 		d->set.it_value = set->it_value;
 		d->set.it_interval = set->it_interval;
+		d->total = 0;
 		uk_thread_wake(d->upthread);
 	}
 }
@@ -126,15 +132,15 @@ static void _timerfd_set(struct timerfd_node *d, const struct itimerspec *set)
 /* Ops */
 
 static ssize_t timerfd_read(const struct uk_file *f,
-			    const struct iovec *iov, int iovcnt,
-			    off_t off, long flags __unused)
+			    const struct iovec *iov, size_t iovcnt,
+			    size_t off, long flags __unused)
 {
 	struct timerfd_node *d;
 	__u64 v;
 
 	if (unlikely(f->vol != TIMERFD_VOLID))
 		return -EINVAL;
-	if (unlikely(off != 0))
+	if (unlikely(off))
 		return -EINVAL;
 	if (unlikely(!iovcnt || iov[0].iov_len < sizeof(__u64)))
 		return -EINVAL;
@@ -208,6 +214,7 @@ static void timerfd_release(const struct uk_file *f, int what)
 static const struct uk_file_ops timerfd_ops = {
 	.read = timerfd_read,
 	.write = uk_file_nop_write,
+	.mem = uk_file_nop_mem,
 	.getstat = uk_file_nop_getstat,
 	.setstat = uk_file_nop_setstat,
 	.ctl = uk_file_nop_ctl
@@ -278,6 +285,8 @@ struct uk_file *uk_timerfile_create(clockid_t id)
 
 /* Internal API */
 
+#if CONFIG_LIBPOSIX_FDTAB
+
 int uk_sys_timerfd_create(clockid_t id, int flags)
 {
 	int ret;
@@ -294,11 +303,25 @@ int uk_sys_timerfd_create(clockid_t id, int flags)
 		mode |= O_NONBLOCK;
 	if (flags & TFD_CLOEXEC)
 		mode |= O_CLOEXEC;
-	ret = uk_fdtab_open(timerf, mode);
+	ret = uk_fdtab_open_named(timerf, mode, TIMERFD_FNAME,
+				  TIMERFD_FNAME_LEN);
 	uk_file_release(timerf);
 	return ret;
 }
 
+#endif /* CONFIG_LIBPOSIX_FDTAB */
+
+/**
+ * Return non-zero if `val` contains either negative or non-canonical times.
+ */
+static inline
+int timerfd_check_settime(const struct itimerspec *val)
+{
+	return !uk_time_spec_canonical(&val->it_value) ||
+	       !uk_time_spec_canonical(&val->it_interval) ||
+	       !uk_time_spec_positive(&val->it_value) ||
+	       !uk_time_spec_positive(&val->it_interval);
+}
 
 int uk_sys_timerfd_settime(const struct uk_file *f, int flags,
 			   const struct itimerspec *new_value,
@@ -307,28 +330,36 @@ int uk_sys_timerfd_settime(const struct uk_file *f, int flags,
 	struct timerfd_node *d;
 	const struct itimerspec *set;
 	struct itimerspec absset;
+	struct timespec t;
 	const int disarm = !new_value->it_value.tv_sec &&
 			   !new_value->it_value.tv_nsec;
+	const int abstime = !!(flags & TFD_TIMER_ABSTIME);
 
 	if (unlikely(flags & ~TFD_TIMER_ABSTIME))
 		return -EINVAL;
 	if (unlikely(f->vol != TIMERFD_VOLID))
 		return -EINVAL;
+	if (unlikely(timerfd_check_settime(new_value)))
+		return -EINVAL;
 
 	d = f->node;
 	uk_file_wlock(f);
-	if (disarm || flags & TFD_TIMER_ABSTIME) {
+	if (old_value || !(disarm || abstime))
+		uk_sys_clock_gettime(d->clkid, &t);
+
+	if (disarm || abstime) {
 		set = new_value;
 	} else {
-		struct timespec t;
-
-		uk_sys_clock_gettime(d->clkid, &t);
 		absset.it_interval = new_value->it_interval;
 		absset.it_value = uk_time_spec_sum(&new_value->it_value, &t);
 		set = &absset;
 	}
-	if (old_value)
-		*old_value = d->set;
+	if (old_value) {
+		struct timerfd_status st = _timerfd_valnext(&d->set, &t);
+
+		old_value->it_interval = d->set.it_interval;
+		old_value->it_value = uk_time_spec_from_nsec(st.next);
+	}
 	_timerfd_set(d, set);
 	(void)_timerfd_update(f);
 	uk_file_wunlock(f);
@@ -358,6 +389,7 @@ int uk_sys_timerfd_gettime(const struct uk_file *f,
 	return 0;
 }
 
+#if CONFIG_LIBPOSIX_FDTAB
 /* Syscalls */
 
 UK_SYSCALL_R_DEFINE(int, timerfd_create, int, id, int, flags)
@@ -379,7 +411,7 @@ UK_SYSCALL_R_DEFINE(int, timerfd_settime, int, fd, int, flags,
 	if (unlikely(!of))
 		return -EBADF;
 	r = uk_sys_timerfd_settime(of->file, flags, new_value, old_value);
-	uk_fdtab_ret(of);
+	uk_ofile_release(of);
 	return r;
 }
 
@@ -396,6 +428,7 @@ UK_SYSCALL_R_DEFINE(int, timerfd_gettime, int, fd,
 	if (unlikely(!of))
 		return -EBADF;
 	r = uk_sys_timerfd_gettime(of->file, curr_value);
-	uk_fdtab_ret(of);
+	uk_ofile_release(of);
 	return r;
 }
+#endif /* CONFIG_LIBPOSIX_FDTAB */

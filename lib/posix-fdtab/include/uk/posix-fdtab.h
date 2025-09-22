@@ -10,7 +10,7 @@
 #define __UK_POSIX_FDTAB_H__
 
 #include <uk/config.h>
-#include <uk/ofile.h>
+#include <uk/posix-fd.h>
 
 #define UK_LIBPOSIX_FDTAB_INIT_PRIO	UK_PRIO_EARLIEST
 #define UK_FD_MAX INT_MAX
@@ -30,9 +30,46 @@
 int uk_fdtab_open(const struct uk_file *f, unsigned int mode);
 
 /**
+ * Open the file `f` with `mode` and `name` of length `len` and associate it
+ * with a file descriptor.
+ *
+ * The lifetime of `f` must cover the entirety of this function call.
+ *
+ * @param f
+ *   File to open
+ * @param mode
+ *   Mode flags to apply on the new open file description
+ * @param name
+ *   If not NULL, a copy will become the new open file description's name
+ * @param len
+ *   If name is supplied, the length of the string contained in name
+ * @return
+ *   The newly allocated file descriptor.
+ */
+int uk_fdtab_open_named(const struct uk_file *f, unsigned int mode,
+			const char *name, size_t len);
+
+/**
+ * Associate a file descriptor to an existing open file description.
+ *
+ * This call consumes the `of` reference. The caller MUST NOT use or release
+ * `of` after this call returns successfully.
+ * In case of error, the reference is left untouched.
+ *
+ * @param of
+ *   Open file description to associate fd with
+ * @param mode
+ *   If contains O_CLOEXEC, the opened fd will be close-on-exec
+ * @return
+ *   >= 0: The newly allocated file descriptor
+ *   <  0: Negative errno
+ */
+int uk_fdtab_open_desc(struct uk_ofile *of, unsigned int mode);
+
+/**
  * Gets the open file description associated with descriptor `fd`.
  *
- * Users should call uk_fdtab_ret when done with the open file reference.
+ * Users should call uk_ofile_release when done with the open file reference.
  *
  * @param fd
  *   File descriptor to look up
@@ -40,14 +77,6 @@ int uk_fdtab_open(const struct uk_file *f, unsigned int mode);
  *   Open file reference or NULL if `fd` is not an open file descriptor.
  */
 struct uk_ofile *uk_fdtab_get(int fd);
-
-/**
- * Returns a reference to an open file when done using it.
- *
- * @param of
- *   Reference to the open file description to be returned
- */
-void uk_fdtab_ret(struct uk_ofile *of);
 
 /**
  * Sets flags on file descriptor. Currently only supports O_CLOEXEC.

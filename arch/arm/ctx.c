@@ -38,6 +38,7 @@
 #if CONFIG_LIBUKDEBUG
 #include <uk/assert.h>
 #include <uk/print.h>
+#include <uk/isr/string.h>
 #else /* !CONFIG_LIBUKDEBUG */
 #define UK_ASSERT(..) do {} while (0)
 #define uk_pr_debug(..) do {} while (0)
@@ -48,6 +49,7 @@ void _ctx_arm_clearregs(void);
 void _ctx_arm_call0(void);
 void _ctx_arm_call1(void);
 void _ctx_arm_call2(void);
+void _ctx_arm_call3(void);
 
 void ukarch_ctx_init(struct ukarch_ctx *ctx,
 		     __uptr sp, int keep_regs,
@@ -60,16 +62,16 @@ void ukarch_ctx_init(struct ukarch_ctx *ctx,
 	UK_ASSERT(ip);			/* IP == NULL would cause a crash */
 	UK_ASSERT(!keep_regs && sp);	/* stack is needed for clearing regs */
 
-	_sp = ukarch_rstack_push(sp, (long) ip);
+	_sp = ukarch_rstack_push(sp, (long)ip);
 	if (keep_regs) {
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_call0);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_call0);
 	} else {
-		_sp = ukarch_rstack_push(_sp, (long) _ctx_arm_call0);
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_clearregs);
+		_sp = ukarch_rstack_push(_sp, (long)_ctx_arm_call0);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_clearregs);
 	}
 
 	uk_pr_debug("ukarch_ctx %p: start:%p sp:%p\n",
-		    ctx, (void *) ip, (void *) sp);
+		    ctx, (void *)ip, (void *)sp);
 }
 
 void ukarch_ctx_init_entry0(struct ukarch_ctx *ctx,
@@ -85,14 +87,14 @@ void ukarch_ctx_init_entry0(struct ukarch_ctx *ctx,
 
 	_sp = ukarch_rstack_push(sp, (long) entry);
 	if (keep_regs) {
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_call0);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_call0);
 	} else {
-		_sp = ukarch_rstack_push(_sp, (long) _ctx_arm_call0);
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_clearregs);
+		_sp = ukarch_rstack_push(_sp, (long)_ctx_arm_call0);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_clearregs);
 	}
 
 	uk_pr_debug("ukarch_ctx %p: entry:%p(), sp:%p\n",
-		    ctx, entry, (void *) sp);
+		    ctx, entry, (void *)sp);
 }
 
 void ukarch_ctx_init_entry1(struct ukarch_ctx *ctx,
@@ -106,17 +108,17 @@ void ukarch_ctx_init_entry1(struct ukarch_ctx *ctx,
 	UK_ASSERT(entry);		/* NULL as func will cause a crash */
 	UK_ASSERT(!(sp & UKARCH_SP_ALIGN_MASK)); /* sp properly aligned? */
 
-	_sp = ukarch_rstack_push(sp, (long) entry);
+	_sp = ukarch_rstack_push(sp, (long)entry);
 	_sp = ukarch_rstack_push(_sp, arg);
 	if (keep_regs) {
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_call1);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_call1);
 	} else {
-		_sp = ukarch_rstack_push(_sp, (long) _ctx_arm_call1);
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_clearregs);
+		_sp = ukarch_rstack_push(_sp, (long)_ctx_arm_call1);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_clearregs);
 	}
 
 	uk_pr_debug("ukarch_ctx %p: entry:%p(%lx), sp:%p\n",
-		    ctx, entry, arg, (void *) sp);
+		    ctx, entry, arg, (void *)sp);
 }
 
 void ukarch_ctx_init_entry2(struct ukarch_ctx *ctx,
@@ -130,16 +132,103 @@ void ukarch_ctx_init_entry2(struct ukarch_ctx *ctx,
 	UK_ASSERT(entry);		/* NULL as func will cause a crash */
 	UK_ASSERT(!(sp & UKARCH_SP_ALIGN_MASK)); /* sp properly aligned? */
 
-	_sp = ukarch_rstack_push(sp, (long) entry);
+	_sp = ukarch_rstack_push(sp, (long)entry);
 	_sp = ukarch_rstack_push(_sp, arg0);
 	_sp = ukarch_rstack_push(_sp, arg1);
 	if (keep_regs) {
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_call2);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_call2);
 	} else {
-		_sp = ukarch_rstack_push(_sp, (long) _ctx_arm_call2);
-		ukarch_ctx_init_bare(ctx, _sp, (long) _ctx_arm_clearregs);
+		_sp = ukarch_rstack_push(_sp, (long)_ctx_arm_call2);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_clearregs);
 	}
 
 	uk_pr_debug("ukarch_ctx %p: entry:%p(%lx, %lx), sp:%p\n",
-		    ctx, entry, arg0, arg1, (void *) sp);
+		    ctx, entry, arg0, arg1, (void *)sp);
+}
+
+void ukarch_ctx_init_entry3(struct ukarch_ctx *ctx,
+			    __uptr sp, int keep_regs,
+			    ukarch_ctx_entry3 entry,
+			    long arg0, long arg1, long arg2)
+{
+	__uptr _sp;
+
+	UK_ASSERT(ctx);
+	UK_ASSERT(sp);			/* a stack is needed */
+	UK_ASSERT(entry);		/* NULL as func will cause a crash */
+	UK_ASSERT(!(sp & UKARCH_SP_ALIGN_MASK)); /* sp properly aligned? */
+
+	_sp = ukarch_rstack_push(sp, (long)entry);
+	_sp = ukarch_rstack_push(_sp, arg0);
+	_sp = ukarch_rstack_push(_sp, arg1);
+	_sp = ukarch_rstack_push(_sp, arg2);
+	if (keep_regs) {
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_call3);
+	} else {
+		_sp = ukarch_rstack_push(_sp, (long)_ctx_arm_call3);
+		ukarch_ctx_init_bare(ctx, _sp, (long)_ctx_arm_clearregs);
+	}
+
+	uk_pr_debug("ukarch_ctx %p: entry:%p(%lx, %lx, %lx), sp:%p\n",
+		    ctx, entry, arg0, arg1, arg2, (void *)sp);
+}
+
+static void ehtrampo_dispatcher(struct ukarch_execenv *ee,
+				ukarch_ehtrampo_entry entry, long arg)
+{
+	UK_ASSERT(ee);
+
+	(*entry)(ee, arg);
+	ukarch_execenv_load((long)ee);
+}
+
+void ukarch_ctx_init_ehtrampo(struct ukarch_ctx *ctx,
+			      struct __regs *r,
+			      __uptr sp,
+			      ukarch_ehtrampo_entry entry, long arg)
+{
+	struct ukarch_execenv *ee;
+
+	UK_ASSERT(ctx);
+	UK_ASSERT(r);
+	UK_ASSERT(sp);			/* a stack is needed */
+	UK_ASSERT(entry);		/* NULL as func will cause a crash */
+	UK_ASSERT(IS_ALIGNED(sp, UKARCH_EXECENV_END_ALIGN));
+
+	sp -= ALIGN_UP(sizeof(*ee), UKARCH_EXECENV_END_ALIGN);
+	ee = (struct ukarch_execenv *)sp;
+
+	ukarch_ectx_sanitize((struct ukarch_ectx *)&ee->ectx);
+	ukarch_ectx_store((struct ukarch_ectx *)&ee->ectx);
+
+	ukarch_sysctx_store(&ee->sysctx);
+
+	/*
+	 * NOTE: Order is important. We save the registers after ectx.
+	 * As the compiler could implement this using memcpy(), we run
+	 * the risk of corrupting the ectx before we had a chance to save it.
+	 */
+	ee->regs = *r;
+
+	sp = ukarch_rstack_push(sp, (long)ehtrampo_dispatcher);
+	sp = ukarch_rstack_push(sp, (long)ee);
+	sp = ukarch_rstack_push(sp, (long)entry);
+	sp = ukarch_rstack_push(sp, (long)arg);
+
+	ukarch_ctx_init_bare(ctx, sp, (long)_ctx_arm_call3);
+}
+
+void ukarch_ctx_jump(struct ukarch_ctx *ctx)
+{
+	UK_ASSERT(ctx);
+
+	__asm__ __volatile__(
+		"mov	sp, %0\n"
+		"br	%1\n"
+		:
+		: "r" (ctx->sp), "r" (ctx->ip)
+		:
+	);
+
+	__builtin_unreachable();
 }

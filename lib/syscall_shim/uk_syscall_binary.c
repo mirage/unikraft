@@ -40,6 +40,7 @@
 #include <uk/arch/ctx.h>
 #include <uk/assert.h>
 #include <uk/essentials.h>
+#include <uk/prio.h>
 #include <uk/thread.h>
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
 #if CONFIG_LIBUKCONSOLE
@@ -70,14 +71,8 @@ struct uk_syscall_ctx {
 
 void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 {
-#if CONFIG_LIBSYSCALL_SHIM_STRACE
-#if CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR
-	char prsyscallbuf[512]; /* ANSI color is pretty hungry */
-#else /* !CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR */
-	char prsyscallbuf[256];
-#endif /* !CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR */
-	int prsyscalllen __maybe_unused;
-#endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
+	struct uk_syscall_enter_ctx enter_ctx;
+	struct uk_syscall_exit_ctx exit_ctx;
 	struct ukarch_auxspcb *auxspcb;
 	struct ukarch_execenv *execenv;
 #if CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS
@@ -106,19 +101,67 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	UK_ASSERT(t->uktlsp == ukarch_auxspcb_get_uktlsp(auxspcb));
 #endif /* CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS */
 
+	uk_syscall_nested_depth++;
+	uk_syscall_enter_ctx_init(&enter_ctx,
+				  execenv, uk_syscall_nested_depth,
+				  UK_SYSCALL_ENTER_CTX_BINARY_SYSCALL);
+	uk_syscall_entertab_run(&enter_ctx);
+
+	execenv->regs.__syscall_rret0 = uk_syscall6_do_e(execenv);
+
+	uk_syscall_exit_ctx_init(&exit_ctx,
+				 execenv, uk_syscall_nested_depth,
+				 UK_SYSCALL_EXIT_CTX_BINARY_SYSCALL);
+	uk_syscall_exittab_run(&exit_ctx);
+	uk_syscall_nested_depth--;
+
+#if CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS
+	t->tlsp = ukarch_sysctx_get_tlsp(&execenv->sysctx);
+#endif /* CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS */
+}
+
 #if CONFIG_LIBSYSCALL_SHIM_DEBUG_HANDLER
+static void binary_syscall_debug_handler(struct uk_syscall_enter_ctx *enter_ctx)
+{
+	struct ukarch_execenv *execenv;
+
+	UK_ASSERT(enter_ctx);
+
+	if (!(enter_ctx->flags & UK_SYSCALL_ENTER_CTX_BINARY_SYSCALL))
+		return;
+
+	execenv = enter_ctx->execenv;
+
 	_uk_printd(uk_libid_self(), __STR_BASENAME__, __LINE__,
-			"Binary system call request \"%s\" (%lu) at ip:%p (arg0=0x%lx, arg1=0x%lx, ...)\n",
-		    uk_syscall_name(execenv->regs.__syscall_rsyscall),
-		    execenv->regs.__syscall_rsyscall,
-		    (void *)execenv->regs.__syscall_rip,
-		    execenv->regs.__syscall_rarg0,
-		    execenv->regs.__syscall_rarg1);
+		   "Binary system call request \"%s\" (%lu) at ip:%p (arg0=0x%lx, arg1=0x%lx, ...)\n",
+		   uk_syscall_name(execenv->regs.__syscall_rsyscall),
+		   execenv->regs.__syscall_rsyscall,
+		   (void *)execenv->regs.__syscall_rip,
+		   execenv->regs.__syscall_rarg0,
+		   execenv->regs.__syscall_rarg1);
+}
+
+uk_syscall_entertab_prio(binary_syscall_debug_handler, UK_PRIO_EARLIEST);
 #endif /* CONFIG_LIBSYSCALL_SHIM_DEBUG_HANDLER */
 
-	execenv->regs.__syscall_rret0 = uk_syscall6_r_e(execenv);
-
 #if CONFIG_LIBSYSCALL_SHIM_STRACE
+static void binary_syscall_strace(struct uk_syscall_exit_ctx *exit_ctx)
+{
+#if CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR
+	char prsyscallbuf[512]; /* ANSI color is pretty hungry */
+#else /* !CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR */
+	char prsyscallbuf[256];
+#endif /* !CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR */
+	int prsyscalllen __maybe_unused;
+	struct ukarch_execenv *execenv;
+
+	UK_ASSERT(exit_ctx);
+
+	if (!(exit_ctx->flags & UK_SYSCALL_EXIT_CTX_BINARY_SYSCALL))
+		return;
+
+	execenv = exit_ctx->execenv;
+
 	prsyscalllen = uk_snprsyscall(prsyscallbuf, ARRAY_SIZE(prsyscallbuf),
 #if CONFIG_LIBSYSCALL_SHIM_STRACE_ANSI_COLOR
 		     UK_PRSYSCALL_FMTF_ANSICOLOR | UK_PRSYSCALL_FMTF_NEWLINE,
@@ -141,13 +184,11 @@ void ukplat_syscall_handler(struct uk_syscall_ctx *usc)
 	 * print calls also turn into a no-op if `ukconsole` is not available.
 	 */
 #if CONFIG_LIBUKCONSOLE
-	uk_console_out(prsyscallbuf, (__sz) prsyscalllen);
+	uk_console_out(prsyscallbuf, (__sz)prsyscalllen);
 #else /* !CONFIG_LIBUKCONSOLE */
 	uk_pr_info(prsyscallbuf);
 #endif /* !CONFIG_LIBUKCONSOLE */
-#endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */
-
-#if CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS
-	t->tlsp = ukarch_sysctx_get_tlsp(&execenv->sysctx);
-#endif /* CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS */
 }
+
+uk_syscall_exittab_prio(binary_syscall_strace, UK_PRIO_LATEST);
+#endif /* CONFIG_LIBSYSCALL_SHIM_STRACE */

@@ -4,6 +4,7 @@ menuconfig LIBVFSCORE
 	select LIBNOLIBC if !HAVE_LIBC
 	select LIBUKDEBUG
 	select LIBUKATOMIC # needed by <uk/list.h>
+	select LIBUKBITOPS
 	select LIBUKLOCK
 	select LIBPOSIX_TIME
 	select LIBPOSIX_FDTAB
@@ -12,6 +13,7 @@ menuconfig LIBVFSCORE
 	select LIBPOSIX_POLL
 	select LIBPOSIX_PIPE
 	select LIBPOSIX_TTY
+	select HAVE_VFS
 
 if LIBVFSCORE
 config LIBVFSCORE_NONLARGEFILE

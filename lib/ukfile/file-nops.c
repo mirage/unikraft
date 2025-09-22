@@ -10,17 +10,27 @@
 
 
 ssize_t uk_file_nop_read(const struct uk_file *f __unused,
-			 const struct iovec *iov __unused, int iovcnt __unused,
-			 off_t off __unused, long flags __unused)
+			 const struct iovec *iov __unused,
+			 size_t iovcnt __unused,
+			 size_t off __unused, long flags __unused)
 {
 	return -ENOSYS;
 }
 
 ssize_t uk_file_nop_write(const struct uk_file *f __unused,
-			  const struct iovec *iov __unused, int iovcnt __unused,
-			  off_t off __unused, long flags __unused)
+			  const struct iovec *iov __unused,
+			  size_t iovcnt __unused,
+			  size_t off __unused, long flags __unused)
 {
 	return -ENOSYS;
+}
+
+ssize_t uk_file_nop_mem(const struct uk_file *f __unused,
+			enum uk_file_mem_op op __unused,
+			size_t off __unused, size_t len __unused,
+			struct iovec *iov __unused, size_t iovcnt __unused)
+{
+	return -ENODEV;
 }
 
 int uk_file_nop_getstat(const struct uk_file *f __unused,
@@ -46,6 +56,7 @@ int uk_file_nop_ctl(const struct uk_file *f __unused, int fam __unused,
 const struct uk_file_ops uk_file_nops = {
 	.read = uk_file_nop_read,
 	.write = uk_file_nop_write,
+	.mem = uk_file_nop_mem,
 	.getstat = uk_file_nop_getstat,
 	.setstat = uk_file_nop_setstat,
 	.ctl = uk_file_nop_ctl

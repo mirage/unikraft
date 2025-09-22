@@ -15,7 +15,12 @@
 #include <uk/atomic.h>
 #include <uk/rwlock.h>
 #include <uk/plat/time.h>
-#include <uk/thread.h>
+#include <uk/wait.h>
+
+#if CONFIG_LIBUKFILE_CHAINUPDATE
+#include <uk/list.h>
+#include <uk/mutex.h>
+#endif /* CONFIG_LIBUKFILE_CHAINUPDATE */
 
 /*
  * Bitmask of event flags.
@@ -26,17 +31,33 @@
  */
 typedef unsigned int uk_pollevent;
 
+struct uk_file;
+
+#if CONFIG_LIBUKFILE_POLLED
 /**
- * Ticket for registering on the poll waiting list.
+ * Callback that fetches events in `mask` currently set on file `f`.
  *
- * If the newly set events overlap with those in `mask`, wake up `thread`.
- * Tickets are atomically released from the wait queue when waking.
+ * This function cannot (meaningfully) fail, must not block indefinitely, and
+ * should avoid taking locks or yielding execution when possible.
+ * This function may be called arbitrarily concurrent.
+ *
+ * Drivers may choose to not provide this callback, in which case they are
+ * responsible for updating the current event levels with `uk_pollq_set`,
+ * `uk_pollq_clear`, and/or `uk_pollq_assign` in-band with I/O operations.
+ *
+ * If drivers do provide this, it will be called every time the instantaneous
+ * level of events is queried. Drivers are then responsible only for notifying
+ * the rising edges of events via `uk_pollq_set`.
+ *
+ * @param f File to fetch events for.
+ * @param mask Bitmask of events to fetch.
+ *
+ * @return
+ *   Bitwise AND between `mask` and the presently set events on `f`
  */
-struct uk_poll_ticket {
-	struct uk_poll_ticket *next;
-	struct uk_thread *thread; /* Thread to wake up */
-	uk_pollevent mask; /* Events to register for */
-};
+typedef uk_pollevent (*uk_poll_func)(const struct uk_file *f,
+				     uk_pollevent mask);
+#endif /* CONFIG_LIBUKFILE_POLLED */
 
 #if CONFIG_LIBUKFILE_CHAINUPDATE
 
@@ -71,18 +92,14 @@ typedef void (*uk_poll_chain_callback_fn)(uk_pollevent ev,
  * If newly modified events overlap with those in `mask`, perform a chain update
  * of these overlapping bits according to `type`:
  *   - UK_POLL_CHAINTYPE_UPDATE: propagate events to `queue`.
- *     If `set` != 0 set/clear events in `set`, instead of original
  *   - UK_POLL_CHAINTYPE_CALLBACK: call `callback`
  */
 struct uk_poll_chain {
-	struct uk_poll_chain *next;
+	UK_STAILQ_ENTRY(struct uk_poll_chain) list_entry;
 	uk_pollevent mask; /* Events to register for */
 	enum uk_poll_chain_type type;
 	union {
-		struct {
-			struct uk_pollq *queue; /* Where to propagate updates */
-			uk_pollevent set; /* Events to set */
-		};
+		struct uk_pollq *queue; /* Where to propagate updates */
 		struct {
 			uk_poll_chain_callback_fn callback;
 			void *arg;
@@ -93,24 +110,23 @@ struct uk_poll_chain {
 /* See comment for main queue below on initializers vs initial values */
 
 /* Initializer for a chain ticket that propagates events to another queue */
-#define UK_POLL_CHAIN_UPDATE_INITIALZER(msk, to, ev) { \
-	.next = NULL, \
+#define UK_POLL_CHAIN_UPDATE_INITIALZER(msk, to) { \
 	.mask = (msk), \
 	.type = UK_POLL_CHAINTYPE_UPDATE, \
 	.queue = (to), \
-	.set = (ev) \
 }
-#define UK_POLL_CHAIN_UPDATE(msk, to, ev) ((struct uk_poll_chain) \
-	UK_POLL_CHAIN_UPDATE_INITIALZER((msk), (to), (ev)))
+
+#define UK_POLL_CHAIN_UPDATE(msk, to) \
+	((struct uk_poll_chain)UK_POLL_CHAIN_UPDATE_INITIALZER((msk), (to)))
 
 /* Initializer for a chain ticket that calls a custom callback */
 #define UK_POLL_CHAIN_CALLBACK_INITIALIZER(msk, cb, dat) { \
-	.next = NULL, \
 	.mask = (msk), \
 	.type = UK_POLL_CHAINTYPE_CALLBACK, \
 	.callback = (cb), \
 	.arg = (dat) \
 }
+
 #define UK_POLL_CHAIN_CALLBACK(msk, cb, dat) ((struct uk_poll_chain) \
 	UK_POLL_CHAIN_CALLBACK_INITIALIZER((msk), (cb), (dat)))
 
@@ -118,168 +134,170 @@ struct uk_poll_chain {
 
 /* Main queue */
 struct uk_pollq {
-	/* Notification lists */
-	struct uk_poll_ticket *wait; /* Polling threads */
-	struct uk_poll_ticket **waitend;
-#if CONFIG_LIBUKFILE_CHAINUPDATE
-	struct uk_poll_chain *prop; /* Registrations for chained updates */
-	struct uk_poll_chain **propend;
-#endif /* CONFIG_LIBUKFILE_CHAINUPDATE */
-
-	/* Events */
-	volatile uk_pollevent events; /* Instantaneous event levels */
-	uk_pollevent waitmask; /* Events waited on by threads */
-#if CONFIG_LIBUKFILE_CHAINUPDATE
-	uk_pollevent propmask; /* Events registered for chaining */
-#endif /* CONFIG_LIBUKFILE_CHAINUPDATE */
-	/* Locks & sundry */
+#if CONFIG_LIBUKFILE_POLLED
+	uk_poll_func poll_fn;
+#endif /* CONFIG_LIBUKFILE_POLLED */
+	uk_pollevent events;
+	uk_pollevent waitmask;
+	struct uk_waitq waitq; /* Polling threads */
+	struct uk_rwlock waitlock;
 #if CONFIG_LIBUKFILE_CHAINUPDATE
 	void *_tag; /* Internal use */
-	struct uk_rwlock proplock; /* Chained updates list lock */
+	UK_STAILQ_HEAD(uk_pollq_chain_head, struct uk_poll_chain) prop;
+	struct uk_mutex proplock;
+	uk_pollevent propmask;
 #endif /* CONFIG_LIBUKFILE_CHAINUPDATE */
-	struct uk_rwlock waitlock; /* Wait list lock */
 };
 
 /*
- * We define initializers separate from an initial values.
+ * Pollqueues come in two varieties: managed and polled.
+ * Polled queues require drivers to only notify rising edges of events, while
+ * providing a callback for fetching instantaneous levels (.poll_fn).
+ * Managed queues require drivers to notify both rising and falling edges
+ * of events, with the queue itself maintaining event levels.
+ * See description of `uk_poll_func` for more details.
+ *
+ * Polled queues require setting LIBUKFILE_POLLED during configuration.
+ */
+/*
+ * We define initializers separate from initial values.
  * The former can only be used in (static) variable initializations, while the
  * latter is meant for assigning to variables or as anonymous data structures.
  */
 #if CONFIG_LIBUKFILE_CHAINUPDATE
-#define UK_POLLQ_EVENTS_INITIALIZER(q, ev) { \
-	.wait = NULL, \
-	.waitend = &(q).wait, \
-	.prop = NULL, \
-	.propend = &(q).prop, \
-	.events = (ev), \
-	.waitmask = 0, \
-	.propmask = 0, \
-	.proplock = UK_RWLOCK_INITIALIZER((q).proplock, 0), \
-	.waitlock = UK_RWLOCK_INITIALIZER((q).waitlock, 0), \
+#if CONFIG_LIBUKFILE_POLLED
+#define __UK_POLLQ_INIT(q, pollfunc, ev) { \
+	.poll_fn = (pollfunc),					\
+	.events = (ev),						\
+	.waitmask = 0,						\
+	.waitq = UK_WAIT_QUEUE_INITIALIZER((q).waitq),		\
+	.waitlock = UK_RWLOCK_INITIALIZER((q).waitlock, 0),	\
+	.prop = UK_STAILQ_HEAD_INITIALIZER((q).prop),		\
+	.proplock = UK_MUTEX_INITIALIZER((q).proplock),		\
+	.propmask = 0,						\
 }
+#else /* !CONFIG_LIBUKFILE_POLLED */
+#define __UK_POLLQ_INIT(q, pollfunc, ev) { \
+	.events = (ev),						\
+	.waitmask = 0,						\
+	.waitq = UK_WAIT_QUEUE_INITIALIZER((q).waitq),		\
+	.waitlock = UK_RWLOCK_INITIALIZER((q).waitlock, 0),	\
+	.prop = UK_STAILQ_HEAD_INITIALIZER((q).prop),		\
+	.proplock = UK_MUTEX_INITIALIZER((q).proplock),		\
+	.propmask = 0,						\
+}
+#endif /* !CONFIG_LIBUKFILE_POLLED */
 #else /* !CONFIG_LIBUKFILE_CHAINUPDATE */
-#define UK_POLLQ_EVENTS_INITIALIZER(q, ev) { \
-	.wait = NULL, \
-	.waitend = &(q).wait, \
-	.events = (ev), \
-	.waitmask = 0, \
-	.waitlock = UK_RWLOCK_INITIALIZER((q).waitlock, 0), \
+#if CONFIG_LIBUKFILE_POLLED
+#define __UK_POLLQ_INIT(q, pollfunc, ev) { \
+	.poll_fn = (pollfunc),					\
+	.events = (ev),						\
+	.waitmask = 0,						\
+	.waitq = UK_WAIT_QUEUE_INITIALIZER((q).waitq),		\
+	.waitlock = UK_RWLOCK_INITIALIZER((q).waitlock, 0),	\
 }
+#else /* !CONFIG_LIBUKFILE_POLLED */
+#define __UK_POLLQ_INIT(q, pollfunc, ev) { \
+	.events = (ev),						\
+	.waitmask = 0,						\
+	.waitq = UK_WAIT_QUEUE_INITIALIZER((q).waitq),		\
+	.waitlock = UK_RWLOCK_INITIALIZER((q).waitlock, 0),	\
+}
+#endif /* !CONFIG_LIBUKFILE_POLLED */
 #endif /* !CONFIG_LIBUKFILE_CHAINUPDATE */
 
-#define UK_POLLQ_EVENTS_INIT_VALUE(q) \
-	((struct uk_pollq)UK_POLLQ_EVENTS_INITIALIZER(q))
+#if CONFIG_LIBUKFILE_POLLED
+#define UK_POLLQ_POLLED_INITIALIZER(q, pollfunc) __UK_POLLQ_INIT(q, pollfunc, 0)
 
-#define UK_POLLQ_INITIALIZER(q) UK_POLLQ_EVENTS_INITIALIZER((q), 0)
-#define UK_POLLQ_INIT_VALUE(q) UK_POLLQ_EVENTS_INIT_VALUE((q), 0)
+#define UK_POLLQ_POLLED_INIT_VALUE(q, pollfunc) \
+	((struct uk_pollq)UK_POLLQ_POLLED_INITIALIZER(q, pollfunc))
+#endif /* CONFIG_LIBUKFILE_POLLED */
 
-/**
- * Initialize the fields of `q` to a valid empty state.
- */
-static inline
-void uk_pollq_init(struct uk_pollq *q)
-{
-	q->wait = NULL;
-	q->waitend = &q->wait;
-	q->events = 0;
-	q->waitmask = 0;
-	uk_rwlock_init(&q->waitlock);
-#if CONFIG_LIBUKFILE_CHAINUPDATE
-	q->prop = NULL;
-	q->propend = &q->prop;
-	q->propmask = 0;
-	uk_rwlock_init(&q->proplock);
-#endif /* CONFIG_LIBUKFILE_CHAINUPDATE */
-}
+#define UK_POLLQ_MANAGED_EVENTS_INITIALIZER(q, ev) __UK_POLLQ_INIT(q, NULL, ev)
+#define UK_POLLQ_MANAGED_INITIALIZER(q) \
+	UK_POLLQ_MANAGED_EVENTS_INITIALIZER(q, 0)
 
-/* Polling cancellation */
-
-/**
- * Remove a specific `ticket` from the wait list.
- */
-static inline
-void uk_pollq_cancel_ticket(struct uk_pollq *q, struct uk_poll_ticket *ticket)
-{
-	uk_rwlock_wlock(&q->waitlock);
-	for (struct uk_poll_ticket **p = &q->wait; *p; p = &(*p)->next)
-		if (*p == ticket) {
-			*p = ticket->next;
-			ticket->next = NULL;
-			if (!*p)
-				q->waitend = p;
-			break;
-		}
-	uk_rwlock_wunlock(&q->waitlock);
-}
-
-/**
- * Remove the ticket of a specific `thread` from the wait list.
- */
-static inline
-void uk_pollq_cancel_thread(struct uk_pollq *q, struct uk_thread *thread)
-{
-	uk_rwlock_wlock(&q->waitlock);
-	for (struct uk_poll_ticket **p = &q->wait; *p; p = &(*p)->next) {
-		struct uk_poll_ticket *t = *p;
-
-		if (t->thread == thread) {
-			*p = t->next;
-			t->next = NULL;
-			if (!*p)
-				q->waitend = p;
-			break;
-		}
-	}
-	uk_rwlock_wunlock(&q->waitlock);
-}
-
-/**
- * Remove the ticket of the current thread from the wait list.
- */
-#define uk_pollq_cancel(q) uk_pollq_cancel_thread((q), uk_thread_current())
+#define UK_POLLQ_MANAGED_EVENTS_INIT_VALUE(q, ev) \
+	((struct uk_pollq)UK_POLLQ_MANAGED_EVENTS_INITIALIZER(q, ev))
+#define UK_POLLQ_MANAGED_INIT_VALUE(q) \
+	((struct uk_pollq)UK_POLLQ_MANAGED_INITIALIZER(q))
 
 /* Polling */
 
+#if CONFIG_LIBUKFILE_POLLED
+
+#define UK_POLLQ_IS_POLLED(q) (!!((q)->poll_fn))
+
 /**
- * Poll for the events in `req`; never block, always return immediately.
- *
- * @return
- *   Bitwise AND between `req` and the events set in `q`.
+ * INTERNAL. Poll for the events in `req`; never block or take locks,
+ * always return immediately.
  */
 static inline
-uk_pollevent uk_pollq_poll_immediate(struct uk_pollq *q, uk_pollevent req)
+uk_pollevent _uk_pollq_poll_immediate(struct uk_pollq *q, uk_pollevent req)
+{
+	return UK_POLLQ_IS_POLLED(q) ? 0 : (q->events & req);
+}
+
+/**
+ * INTERNAL. Poll for the events in `req` with the waitlock held; may block.
+ */
+static inline
+uk_pollevent _uk_pollq_poll_locked(struct uk_pollq *q, uk_pollevent req,
+				   const struct uk_file *f)
+{
+	return UK_POLLQ_IS_POLLED(q) ? q->poll_fn(f, req) : (q->events & req);
+}
+#else /* !CONFIG_LIBUKFILE_POLLED */
+/**
+ * INTERNAL. Poll for the events in `req`; never block or take locks,
+ * always return immediately.
+ */
+static inline
+uk_pollevent _uk_pollq_poll_immediate(struct uk_pollq *q, uk_pollevent req)
 {
 	return q->events & req;
 }
+
+/**
+ * INTERNAL. Poll for the events in `req` with the waitlock held; may block.
+ */
+static inline
+uk_pollevent _uk_pollq_poll_locked(struct uk_pollq *q, uk_pollevent req,
+				   const struct uk_file *f __unused)
+{
+	return _uk_pollq_poll_immediate(q, req);
+}
+#endif
 
 /**
  * INTERNAL. Atomically poll & lock if required.
  *
  * @param q Target queue.
  * @param req Events to poll for.
- * @param exp Events expected to be already set.
+ * @param f File whose events to poll.
  *
  * @return
  *   non-zero evmask with lock released if events appeared
  *   0 with lock held otherwise.
  */
 static inline
-uk_pollevent _pollq_lock(struct uk_pollq *q, uk_pollevent req,
-			 uk_pollevent exp)
+uk_pollevent _uk_pollq_lock(struct uk_pollq *q, uk_pollevent req,
+			    const struct uk_file *f)
 {
 	uk_pollevent ev;
 
 	uk_rwlock_rlock(&q->waitlock);
 	/* Check if events were set while acquiring the lock */
-	if ((ev = uk_pollq_poll_immediate(q, req) & ~exp))
+	if ((ev = _uk_pollq_poll_locked(q, req, f)))
 		uk_rwlock_runlock(&q->waitlock);
 	return ev;
 }
 
 /**
- * INTERNAL. Wait for events until a timeout.
+ * INTERNAL. Wait for events or until a timeout.
  *
- * Must be called only after `_pollq_lock` returns 0.
+ * Must be called only after `_pollq_lock` returns 0 (read waitlock held).
+ * Returns with read waitlock held.
  *
  * @param q Target queue.
  * @param req Events to poll for.
@@ -290,37 +308,46 @@ uk_pollevent _pollq_lock(struct uk_pollq *q, uk_pollevent req,
  *   non-zero if awoken
  */
 static inline
-int _pollq_wait(struct uk_pollq *q, uk_pollevent req, __nsec deadline)
+int _uk_pollq_wait(struct uk_pollq *q, uk_pollevent req, __nsec deadline)
 {
-	struct uk_poll_ticket **tail;
-	struct uk_thread *__current;
-	struct uk_poll_ticket tick;
-	int timeout;
-
 	/* Mark request in waitmask */
 	(void)uk_or(&q->waitmask, req);
-	/* Compete to register */
+	/* Set events as cookie & wait */
+	uk_waitq_set_cookie(req);
+	return !uk_waitq_wait_deadline_locked(&q->waitq, deadline,
+					      uk_rwlock_rlock,
+					      uk_rwlock_runlock,
+					      &q->waitlock);
+}
 
-	__current = uk_thread_current();
-	tick = (struct uk_poll_ticket){
-		.next = NULL,
-		.thread = __current,
-		.mask = req,
-	};
-	tail = uk_exchange_n(&q->waitend, &tick.next);
-	/* tail is ours alone, safe to link in */
-	UK_ASSERT(!*tail); /* Should be a genuine list tail */
-	*tail = &tick;
+/**
+ * Poll for the events in `req`, returning the present levels of events.
+ *
+ * May yield execution or acquire locks, but will never wait on events.
+ *
+ * @param q Target queue.
+ * @param req Events to poll for.
+ * @param f File to poll for events, in case of an edge-triggered `q`.
+ *
+ * @return
+     Bitwise AND between `req` and the events set in `q`
+ */
+static inline
+uk_pollevent uk_pollq_poll_level(struct uk_pollq *q, uk_pollevent req,
+				 const struct uk_file *f __maybe_unused)
+{
+	uk_pollevent ev;
 
-	/* Block until awoken */
-	uk_thread_block_until(__current, deadline);
-	uk_rwlock_runlock(&q->waitlock);
-	uk_sched_yield();
-	/* Back, wake up, check if timed out & try again */
-	timeout = deadline && ukplat_monotonic_clock() >= deadline;
-	if (timeout)
-		uk_pollq_cancel_ticket(q, &tick);
-	return !timeout;
+	if ((ev = _uk_pollq_poll_immediate(q, req)))
+		return ev;
+#if CONFIG_LIBUKFILE_POLLED
+	if (UK_POLLQ_IS_POLLED(q)) {
+		ev = _uk_pollq_lock(q, req, f);
+		if (!ev)
+			uk_rwlock_runlock(&q->waitlock);
+	}
+#endif /* CONFIG_LIBUKFILE_POLLED */
+	return ev;
 }
 
 /**
@@ -335,16 +362,19 @@ int _pollq_wait(struct uk_pollq *q, uk_pollevent req, __nsec deadline)
  */
 static inline
 uk_pollevent uk_pollq_poll_until(struct uk_pollq *q, uk_pollevent req,
-				 __nsec deadline)
+				 __nsec deadline, const struct uk_file *f)
 {
 	uk_pollevent ev;
 
-	do {
-		if ((ev = uk_pollq_poll_immediate(q, req)))
-			return ev;
-		if ((ev = _pollq_lock(q, req, 0)))
-			return ev;
-	} while (_pollq_wait(q, req, deadline));
+	if ((ev = _uk_pollq_poll_immediate(q, req)))
+		return ev;
+	if ((ev = _uk_pollq_lock(q, req, f)))
+		return ev;
+	while (_uk_pollq_wait(q, req, deadline)) {
+		if ((ev = _uk_pollq_poll_locked(q, req, f)))
+			break;
+	}
+	uk_rwlock_runlock(&q->waitlock);
 	return ev;
 }
 
@@ -357,55 +387,7 @@ uk_pollevent uk_pollq_poll_until(struct uk_pollq *q, uk_pollevent req,
  * @return
  *   Bitwise AND between `req` and the events set in `q`
  */
-#define uk_pollq_poll(q, req) uk_pollq_poll_until(q, req, 0)
-
-/**
- * Poll for event rising edges in `req`, blocking until `deadline` or an edge.
- *
- * In contrast to normal poll, will not return immediately if events are set,
- * nor return which events were detected.
- * Use `uk_pollq_poll_immediate` to check the current set events, however events
- * may have been modified in the meantime, potentially leading to lost edges.
- * To correctly handle these missed edges, use update chaining.
- *
- * @param q Target queue.
- * @param req Events to poll for.
- * @param deadline Max number of nanoseconds to wait for, or 0 if forever
- *
- * @return
- *   1 if a rising edge was detected,
- *   0 if timed out
- */
-static inline
-int uk_pollq_edge_poll_until(struct uk_pollq *q, uk_pollevent req,
-			     __nsec deadline)
-{
-	uk_pollevent level = uk_pollq_poll_immediate(q, req);
-
-	/* Acquire lock & check for new events */
-	if (_pollq_lock(q, req, level))
-		return 1;
-	/* Wait for notification */
-	return _pollq_wait(q, req, deadline);
-}
-
-/**
- * Poll for event rising edges in `req`, blocking until a rising edge.
- *
- * In contrast to normal poll, will not return immediately if events are set,
- * nor return which events were detected.
- * Use `uk_pollq_poll_immediate` to check the current set events.
- * To correctly handle missed edges, use update chaining.
- *
- * @param q Target queue.
- * @param req Events to poll for.
- *
- * @return
- *   1 if a rising edge was detected,
- *   0 if timed out
- */
-#define uk_pollq_edge_poll(q, req) uk_pollq_edge_poll_until(q, req, 0)
-
+#define uk_pollq_poll(q, req, f) uk_pollq_poll_until(q, req, 0, f)
 
 #if CONFIG_LIBUKFILE_CHAINUPDATE
 /* Propagation */
@@ -413,20 +395,16 @@ int uk_pollq_edge_poll_until(struct uk_pollq *q, uk_pollevent req,
 /**
  * INTERNAL. Register update chaining ticket.
  *
- * Must be called with appropriate locks held
+ * Must be called with prop lock held.
  *
  * @param q Target queue.
  * @param tick Update chaining ticket to register.
  */
 static inline
-void _pollq_register(struct uk_pollq *q, struct uk_poll_chain *tick)
+void _uk_pollq_register(struct uk_pollq *q, struct uk_poll_chain *tick)
 {
-	struct uk_poll_chain **tail;
-
-	(void)uk_or(&q->propmask, tick->mask);
-	tail = uk_exchange_n(&q->propend, &tick->next);
-	UK_ASSERT(!*tail); /* Should be genuine list tail */
-	*tail = tick;
+	q->propmask |= tick->mask;
+	UK_STAILQ_INSERT_TAIL(&q->prop, tick, list_entry);
 }
 
 /**
@@ -438,9 +416,9 @@ void _pollq_register(struct uk_pollq *q, struct uk_poll_chain *tick)
 static inline
 void uk_pollq_register(struct uk_pollq *q, struct uk_poll_chain *tick)
 {
-	uk_rwlock_rlock(&q->proplock);
-	_pollq_register(q, tick);
-	uk_rwlock_runlock(&q->proplock);
+	uk_mutex_lock(&q->proplock);
+	_uk_pollq_register(q, tick);
+	uk_mutex_unlock(&q->proplock);
 }
 
 /**
@@ -452,16 +430,9 @@ void uk_pollq_register(struct uk_pollq *q, struct uk_poll_chain *tick)
 static inline
 void uk_pollq_unregister(struct uk_pollq *q, struct uk_poll_chain *tick)
 {
-	uk_rwlock_wlock(&q->proplock);
-	for (struct uk_poll_chain **p = &q->prop; *p; p = &(*p)->next)
-		if (*p == tick) {
-			*p = tick->next;
-			tick->next = NULL;
-			if (!*p) /* We unlinked last node */
-				q->propend = p;
-			break;
-		}
-	uk_rwlock_wunlock(&q->proplock);
+	uk_mutex_lock(&q->proplock);
+	UK_STAILQ_REMOVE(&q->prop, tick, struct uk_poll_chain, list_entry);
+	uk_mutex_unlock(&q->proplock);
 }
 
 /**
@@ -469,57 +440,30 @@ void uk_pollq_unregister(struct uk_pollq *q, struct uk_poll_chain *tick)
  *
  * @param q Target queue.
  * @param tick Update chaining ticket to register, if needed.
- * @param force If 0, will immediately return without registering if any of the
- *   requested events are set. If non-zero, always register.
+ * @param always_register If 0, will immediately return without registering if
+ *   any of the requested events are set. If non-zero, always register.
  *
  * @return
  *   Requested events that are currently active.
  */
 static inline
 uk_pollevent uk_pollq_poll_register(struct uk_pollq *q,
-				    struct uk_poll_chain *tick, int force)
+				    struct uk_poll_chain *tick,
+				    int always_register,
+				    const struct uk_file *f)
 {
 	uk_pollevent ev;
 	uk_pollevent req = tick->mask;
 
-	if (!force && (ev = uk_pollq_poll_immediate(q, req)))
+	if (!always_register && (ev = _uk_pollq_poll_immediate(q, req)))
 		return ev;
 	/* Might need to register */
-	uk_rwlock_rlock(&q->proplock);
-	if ((ev = uk_pollq_poll_immediate(q, req)) && !force)
+	uk_mutex_lock(&q->proplock);
+	if ((ev = _uk_pollq_poll_locked(q, req, f)) && !always_register)
 		goto out;
-	_pollq_register(q, tick);
+	_uk_pollq_register(q, tick);
 out:
-	uk_rwlock_runlock(&q->proplock);
-	return ev;
-}
-
-/**
- * Poll for event rising edges and/or register for propagation on `q`.
- *
- * @param q Target queue.
- * @param tick Update chaining ticket to register, if needed.
- * @param force If 0, will immediately return without registering if any of the
- *   requested event rising edges are detected. If non-zero, always register.
- *
- * @return
- *   Detected rising edges of requested events.
- */
-static inline
-uk_pollevent uk_pollq_edge_poll_register(struct uk_pollq *q,
-					 struct uk_poll_chain *tick,
-					 int force)
-{
-	uk_pollevent ev;
-	uk_pollevent req = tick->mask;
-	uk_pollevent level = uk_pollq_poll_immediate(q, req);
-
-	uk_rwlock_rlock(&q->proplock);
-	if ((ev = uk_pollq_poll_immediate(q, req) & ~level) && !force)
-		goto out;
-	_pollq_register(q, tick);
-out:
-	uk_rwlock_runlock(&q->proplock);
+	uk_mutex_unlock(&q->proplock);
 	return ev;
 }
 #endif /* CONFIG_LIBUKFILE_CHAINUPDATE */
@@ -527,7 +471,21 @@ out:
 /* Updating */
 
 /**
+ * Update events, setting those in `set` and handling notifications.
+ *
+ * @param q Target queue.
+ * @param set Events to set.
+ * @param one If zero, notify all waiting threads, if non-zero notify at most 1.
+ *
+ * @return
+ *   The previous event set.
+ */
+uk_pollevent uk_pollq_set_n(struct uk_pollq *q, uk_pollevent set, int one);
+
+/**
  * Update events, clearing those in `clr`.
+ *
+ * Only meaningful on managed queues, no-op on polled queues.
  *
  * @param q Target queue.
  * @param clr Events to clear.
@@ -538,55 +496,21 @@ out:
 uk_pollevent uk_pollq_clear(struct uk_pollq *q, uk_pollevent clr);
 
 /**
- * Update events, setting those in `set` and handling notifications.
- *
- * @param q Target queue.
- * @param set Events to set.
- * @param n Maximum number of threads to wake up. If < 0 wake up all threads.
- *   Chained updates have their own defined notification semantics and may
- *   notify more threads than specified in `n`.
- *
- * @return
- *   The previous event set.
- */
-uk_pollevent uk_pollq_set_n(struct uk_pollq *q, uk_pollevent set, int n);
-
-/**
  * Replace the events in `q` with `val` and handle notifications.
+ *
+ * Only meaningful on managed queues, identical to set on polled queues.
  *
  * @param q Target queue.
  * @param val New event set.
- * @param n Maximum number of threads to wake up. If < 0 wake up all threads.
- *   Chained updates have their own defined notification semantics and may
- *   notify more threads than specified in `n`
+ * @param one If zero, notify all waiting threads, if non-zero notify at most 1.
  *
  * @return
  *   The previous event set.
  */
-uk_pollevent uk_pollq_assign_n(struct uk_pollq *q, uk_pollevent val, int n);
+uk_pollevent uk_pollq_assign_n(struct uk_pollq *q, uk_pollevent val, int one);
 
-#define UK_POLLQ_NOTIFY_ALL -1
+#define uk_pollq_set(q, s) uk_pollq_set_n(q, s, 0)
 
-/**
- * Update events, setting those in `set` and handling notifications.
- *
- * @param q Target queue.
- * @param set Events to set.
- *
- * @return
- *   The previous event set.
- */
-#define uk_pollq_set(q, s) uk_pollq_set_n(q, s, UK_POLLQ_NOTIFY_ALL)
-
-/**
- * Replace the events in `q` with `val` and handle notifications.
- *
- * @param q Target queue.
- * @param val New event set.
- *
- * @return
- *   The previous event set.
- */
-#define uk_pollq_assign(q, s) uk_pollq_assign_n(q, s, UK_POLLQ_NOTIFY_ALL)
+#define uk_pollq_assign(q, s) uk_pollq_assign_n(q, s, 0)
 
 #endif /* __UKFILE_POLLQUEUE_H__ */

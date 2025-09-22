@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <sys/statfs.h>
 #include <sys/time.h>
+#include <vfscore/file.h>
 
 /*
  * Tunable parameters
@@ -163,19 +164,6 @@ int sys_read(struct vfscore_file *fp, const struct iovec *iov, size_t niov,
  */
 int sys_write(struct vfscore_file *fp, const struct iovec *iov, size_t niov,
 		off_t offset, size_t *count);
-
-
-/**
- * Synchronizes the in-core data referred by vfscore_file to the backing
- * store device.
- *
- * @param fp
- *	Pointer to the vfscore_file structure
- * @return
- *	- (0):  Completed successfully
- *	- (<0): Negative value with error code
- */
-int sys_fsync(struct vfscore_file *fp);
 
 /**
  * Gets the next directory entry in the directory stream.
@@ -429,20 +417,6 @@ int sys_fstatfs(struct vfscore_file *fp, struct statfs *buf);
 int sys_truncate(char *path, off_t length);
 
 /**
- * Similar to the sys_truncate() function, but it takes a vfscore_file
- * instead of path.
- *
- * @param fp
- *	Pointer to the vfscore_file
- * @param length
- *	The new size (in bytes) of the file to which fp is referring to
- * @return
- *	- (0):  Completed successfully
- *	- (<0): Negative value with error code
- */
-int sys_ftruncate(struct vfscore_file *fp, off_t length);
-
-/**
  * Store at most bufsize bytes from the content to which the symlink
  * at path is pointing in the char array buf. The number of bytes written
  * in buf is stored in size.
@@ -522,32 +496,6 @@ int sys_utimensat(int dirfd, const char *pathname,
 int sys_futimens(int fd, const struct timespec times[2]);
 
 /**
- * Manipulates the file space for the file referred by fd, starting
- * at offset and continuing for len bytes.
- *
- * @param fp
- *	Pointer to a vfscore_file structure
- * @param mode
- *	Specifies how to manipulates the space. The mode can have the
- *	the following values:
- *		* 0 - allocates len bytes starting from offset.
- *		* FALLOC_FL_KEEP_SIZE - the file size will not change even
- *			if offset + len is greater than the file size.
- *		* FALLOC_FL_PUNCH_HOLE - deallocates len bytes starting at
- *			offset and creates a hole in the file. This flag should
- *			always come together with FALLOC_FL_KEEP_SIZE, otherwise
- *			the sys_futimens call will fail.
- * @param offset
- *	Starting byte from which this operation will apply
- * @param len
- *	Number of bytes for which this operation will apply
- * @return
- *	- (0):  Completed successfully
- *	- (<0): Negative value with error code
- */
-int sys_fallocate(struct vfscore_file *fp, int mode, loff_t offset, loff_t len);
-
-/**
  * This function is not used at this point.
  */
 int sys_pivot_root(const char *new_root, const char *old_put);
@@ -571,19 +519,6 @@ void sync(void);
 int	sys_chmod(const char *path, mode_t mode);
 
 /**
- * Changes mode of the file specified by the open file descriptor fd.
- *
- * @param fd
- *	An open file descriptor
- * @param mode
- *	The new file mode
- * @return
- *	- (0):  Completed successfully
- *	- (<0): Negative value with error code
- */
-int sys_fchmod(int fd, mode_t mode);
-
-/**
  * Converts to full path from the cwd of task and path.
  *
  * @param t
@@ -601,6 +536,26 @@ int sys_fchmod(int fd, mode_t mode);
 int task_conv(struct task *t, const char *path, int mode, char *full);
 
 /**
+ * Converts to full path from the cwd of a task or dirfd and path.
+ *
+ * @param t
+ *	Pointer to task containing the cwd
+ * @param dirfd
+ *	File descriptor of directory to be used as instead of the task's cwd.
+ *	If dirfd == AT_FDCWD, the task's cwd (parameter `t`) is used.
+ * @param path
+ *	The target path
+ * @param mode
+ *	Unused parameter
+ * @param[out] full
+ *	Full path to be returned
+ * @return
+ *	- (0):  Completed successfully
+ *	- (<0): Negative value with error code
+ */
+int taskat_conv(struct task *t, int dirfd, const char *path, char *full);
+
+/**
  * Converts to full path from the wd of task and cpath.
  *
  * @param wd
@@ -613,7 +568,7 @@ int task_conv(struct task *t, const char *path, int mode, char *full);
  *	- (0):  Completed successfully
  *	- (<0): Negative value with error code
  */
-int path_conv(char *wd, const char *cpath, char *full);
+int path_conv(const char *wd, const char *cpath, char *full);
 
 /**
  * This function is not implemented or used at this point.

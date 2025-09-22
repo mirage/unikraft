@@ -3,9 +3,12 @@
  * Simple memory pool using LIFO principle
  *
  * Authors: Simon Kuenzer <simon.kuenzer@neclab.eu>
+ *          Marc Rittinghaus <marc.rittinghaus@kit.edu>
  *
  *
  * Copyright (c) 2020, NEC Laboratories Europe GmbH, NEC Corporation,
+ *                     All rights reserved.
+ *               2022, Karlsruhe Institute of Technology (KIT),
  *                     All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -68,14 +71,20 @@ struct uk_allocpool {
 
 	struct uk_list_head free_obj;
 	unsigned int free_obj_count;
+	unsigned int obj_count;
 
 	__sz obj_align;
 	__sz obj_len;
-	unsigned int obj_count;
 
 	struct uk_alloc *parent;
 	void *base;
+
+	void *free_pool_pos;
 };
+
+#define POOL_END(p)							\
+	((void *)(ALIGN_UP((__uptr)(p)->base + sizeof(*(p)),		\
+		(p)->obj_align) + (p)->obj_count * (p)->obj_len))
 
 struct free_obj {
 	struct uk_list_head list;
@@ -103,24 +112,43 @@ static inline void _prepend_free_obj(struct uk_allocpool *p, void *obj)
 	UK_ASSERT(p);
 	UK_ASSERT(obj);
 	UK_ASSERT(p->free_obj_count < p->obj_count);
+	UK_ASSERT(IS_ALIGNED((__sz)obj, p->obj_align));
 
-	entry = &((struct free_obj *) obj)->list;
+	entry = &((struct free_obj *)obj)->list;
 	uk_list_add(entry, &p->free_obj);
 	p->free_obj_count++;
 }
 
-static inline void *_take_free_obj(struct uk_allocpool *p)
+static inline void *_try_take_free_obj(struct uk_allocpool *p)
 {
 	struct free_obj *obj;
 
 	UK_ASSERT(p);
-	UK_ASSERT(p->free_obj_count > 0);
 
-	/* get object from list head */
-	obj = uk_list_first_entry(&p->free_obj, struct free_obj, list);
-	uk_list_del(&obj->list);
+	if (uk_list_empty(&p->free_obj)) {
+		/* The free list is empty. Check if there is still unused pool
+		 * memory that we can use
+		 */
+		if (unlikely(p->free_obj_count == 0)) {
+			errno = ENOMEM;
+			return NULL;
+		}
+
+		obj = p->free_pool_pos;
+
+		UK_ASSERT((__uptr)obj <= (__uptr)POOL_END(p) - p->obj_len);
+		p->free_pool_pos = (void *)((__uptr)obj + p->obj_len);
+	} else {
+		/* We can take an object from the free list */
+		obj = uk_list_first_entry(&p->free_obj, struct free_obj, list);
+		uk_list_del(&obj->list);
+	}
+
+	UK_ASSERT(p->free_obj_count > 0);
 	p->free_obj_count--;
-	return (void *) obj;
+
+	UK_ASSERT(IS_ALIGNED((__sz)obj, p->obj_align));
+	return (void *)obj;
 }
 
 static void pool_free(struct uk_alloc *a, void *ptr)
@@ -133,38 +161,30 @@ static void pool_free(struct uk_alloc *a, void *ptr)
 	}
 }
 
-static void *pool_malloc(struct uk_alloc *a, __sz size)
+static void *pool_malloc(struct uk_alloc *a, __sz size __maybe_unused)
 {
 	struct uk_allocpool *p = ukalloc2pool(a);
 	void *obj;
 
-	if (unlikely((size > p->obj_len)
-		     || uk_list_empty(&p->free_obj))) {
-		uk_alloc_stats_count_enomem(a, p->obj_len);
-		errno = ENOMEM;
-		return NULL;
-	}
+	UK_ASSERT(size <= p->obj_len);
 
-	obj = _take_free_obj(p);
+	obj = _try_take_free_obj(p);
 	uk_alloc_stats_count_alloc(a, obj, p->obj_len);
 	return obj;
 }
 
-static int pool_posix_memalign(struct uk_alloc *a, void **memptr, __sz align,
-			       __sz size)
+static int pool_posix_memalign(struct uk_alloc *a, void **memptr,
+			       __sz align __maybe_unused,
+			       __sz size __maybe_unused)
 {
 	struct uk_allocpool *p = ukalloc2pool(a);
 
-	if (unlikely((size > p->obj_len)
-		     || (align > p->obj_align)
-		     || uk_list_empty(&p->free_obj))) {
-		uk_alloc_stats_count_enomem(a, p->obj_len);
-		return ENOMEM;
-	}
+	UK_ASSERT(size <= p->obj_len);
+	UK_ASSERT(p->obj_align % align == 0);
 
-	*memptr = _take_free_obj(p);
+	*memptr = _try_take_free_obj(p);
 	uk_alloc_stats_count_alloc(a, *memptr, p->obj_len);
-	return 0;
+	return (likely(*memptr)) ? 0 : ENOMEM;
 }
 
 void *uk_allocpool_take(struct uk_allocpool *p)
@@ -173,13 +193,7 @@ void *uk_allocpool_take(struct uk_allocpool *p)
 
 	UK_ASSERT(p);
 
-	if (unlikely(uk_list_empty(&p->free_obj))) {
-		uk_alloc_stats_count_enomem(allocpool2ukalloc(p),
-					    p->obj_len);
-		return NULL;
-	}
-
-	obj = _take_free_obj(p);
+	obj = _try_take_free_obj(p);
 	uk_alloc_stats_count_alloc(allocpool2ukalloc(p),
 				   obj, p->obj_len);
 	return obj;
@@ -194,16 +208,12 @@ unsigned int uk_allocpool_take_batch(struct uk_allocpool *p,
 	UK_ASSERT(obj);
 
 	for (i = 0; i < count; ++i) {
-		if (unlikely(uk_list_empty(&p->free_obj)))
-			break;
-		obj[i] = _take_free_obj(p);
+		obj[i] = _try_take_free_obj(p);
 		uk_alloc_stats_count_alloc(allocpool2ukalloc(p),
 					   obj[i], p->obj_len);
+		if (unlikely(!obj[i]))
+			break;
 	}
-
-	if (unlikely(i == 0))
-		uk_alloc_stats_count_enomem(allocpool2ukalloc(p),
-					    p->obj_len);
 
 	return i;
 }
@@ -236,14 +246,14 @@ static __ssz pool_availmem(struct uk_alloc *a)
 {
 	struct uk_allocpool *p = ukalloc2pool(a);
 
-	return (__ssz) (p->free_obj_count * p->obj_len);
+	return (__ssz)(p->free_obj_count * p->obj_len);
 }
 
 static __ssz pool_maxalloc(struct uk_alloc *a)
 {
 	struct uk_allocpool *p = ukalloc2pool(a);
 
-	return (__ssz) p->obj_len;
+	return (__ssz)p->obj_len;
 }
 
 __sz uk_allocpool_reqmem(unsigned int obj_count, __sz obj_len,
@@ -258,12 +268,17 @@ __sz uk_allocpool_reqmem(unsigned int obj_count, __sz obj_len,
 	obj_alen  = ALIGN_UP(obj_len, obj_align);
 	return (sizeof(struct uk_allocpool)
 		+ obj_align
-		+ ((__sz) obj_count * obj_alen));
+		+ ((__sz)obj_count * obj_alen));
 }
 
 unsigned int uk_allocpool_availcount(struct uk_allocpool *p)
 {
 	return p->free_obj_count;
+}
+
+unsigned int uk_allocpool_maxcount(struct uk_allocpool *p)
+{
+	return p->obj_count;
 }
 
 __sz uk_allocpool_objlen(struct uk_allocpool *p)
@@ -282,7 +297,7 @@ struct uk_allocpool *uk_allocpool_init(void *base, __sz len,
 
 	UK_ASSERT(POWER_OF_2(obj_align));
 
-	if (!base || sizeof(struct uk_allocpool) > len) {
+	if (unlikely(!base || sizeof(struct uk_allocpool) > len)) {
 		errno = ENOSPC;
 		return NULL;
 	}
@@ -291,35 +306,32 @@ struct uk_allocpool *uk_allocpool_init(void *base, __sz len,
 	obj_len   = MAX(obj_len, MIN_OBJ_LEN);
 	obj_align = MAX(obj_align, MIN_OBJ_ALIGN);
 
-	p = (struct uk_allocpool *) base;
+	p = (struct uk_allocpool *)base;
 	memset(p, 0, sizeof(*p));
 	a = allocpool2ukalloc(p);
 
 	obj_alen = ALIGN_UP(obj_len, obj_align);
-	obj_ptr = (void *) ALIGN_UP((__uptr) base + sizeof(*p),
-				    obj_align);
-	if ((__uptr) obj_ptr > (__uptr) base + len) {
-		uk_pr_debug("%p: Empty pool: Not enough space for allocating objects\n",
-			    p);
-		goto out;
+	obj_ptr = (void *)ALIGN_UP((__uptr)base + sizeof(*p), obj_align);
+	if (unlikely((__uptr)obj_ptr > (__uptr)base + len)) {
+		errno = ENOSPC;
+		return NULL;
 	}
 
-	left = len - ((__uptr) obj_ptr - (__uptr) base);
+	left = len - ((__uptr)obj_ptr - (__uptr)base);
 
-	p->obj_count = 0;
-	p->free_obj_count = 0;
+	p->obj_count = left / obj_alen;
+	if (unlikely(p->obj_count == 0)) {
+		errno = ENOSPC;
+		return NULL;
+	}
+
+	p->free_obj_count = p->obj_count;
 	UK_INIT_LIST_HEAD(&p->free_obj);
-	while (left >= obj_alen) {
-		++p->obj_count;
-		_prepend_free_obj(p, obj_ptr);
-		obj_ptr = (void *) ((__uptr) obj_ptr + obj_alen);
-		left -= obj_alen;
-	}
 
-out:
 	p->obj_len         = obj_alen;
 	p->obj_align       = obj_align;
 	p->base            = base;
+	p->free_pool_pos   = obj_ptr;
 	p->parent          = NULL;
 
 	uk_alloc_init_malloc(a,
@@ -349,13 +361,12 @@ struct uk_allocpool *uk_allocpool_alloc(struct uk_alloc *parent,
 	/* uk_allocpool_reqmem computes minimum requirement */
 	len = uk_allocpool_reqmem(obj_count, obj_len, obj_align);
 	base = uk_malloc(parent, len);
-	if (!base)
+	if (unlikely(!base))
 		return NULL;
 
 	p = uk_allocpool_init(base, len, obj_len, obj_align);
-	if (!p) {
+	if (unlikely(!p)) {
 		uk_free(parent, base);
-		errno = ENOSPC;
 		return NULL;
 	}
 

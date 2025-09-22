@@ -30,6 +30,9 @@ extern "C" {
 #ifndef __packed
 #define __packed               __attribute__((packed))
 #endif
+#ifndef __bitwise
+#define __bitwise               __attribute__((bitwise))
+#endif
 #ifndef __noreturn
 #define __noreturn             __attribute__((noreturn))
 #endif
@@ -50,6 +53,9 @@ extern "C" {
 #endif
 #ifndef __nonnull
 #define __nonnull              __attribute__((nonnull))
+#endif
+#ifndef __nonstring
+#define __nonstring            __attribute__((nonstring))
 #endif
 #ifndef __printf
 #define __printf(fmt, args)    __attribute__((format(printf, (fmt), (args))))

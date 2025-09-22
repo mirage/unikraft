@@ -56,6 +56,8 @@
 #include <fcntl.h>
 #include <vfscore/fs.h>
 
+#include <uk/posix-time.h>
+
 /* 16 bits are enough for file mode as defined by POSIX, the rest we can use */
 #define RAMFS_MODEMASK 0xffff
 #define RAMFS_DELMODE 0x10000
@@ -70,8 +72,19 @@ set_times_to_now(struct timespec *time1, struct timespec *time2,
 		 struct timespec *time3)
 {
 	struct timespec now;
+	int rc;
 
-	clock_gettime(CLOCK_REALTIME, &now);
+	rc = uk_sys_clock_gettime(CLOCK_REALTIME, &now);
+	if (unlikely(rc)) {
+		/*
+		 * We do not consider this a fatal error, but rather
+		 * something that might indicate a misconfigured kernel.
+		 * Just print the error and ignore.
+		 */
+		uk_pr_err("Failed to set current time for vnode: %d\n", rc);
+		UK_ASSERT(rc < 0);
+	}
+
 	if (time1)
 		memcpy(time1, &now, sizeof(struct timespec));
 	if (time2)
@@ -693,7 +706,7 @@ static int ramfs_ioctl(struct vnode *dvp __unused,
 #define ramfs_seek      ((vnop_seek_t)vfscore_vop_nullop)
 #define ramfs_fsync     ((vnop_fsync_t)vfscore_vop_nullop)
 #define ramfs_link      ((vnop_link_t)vfscore_vop_eperm)
-#define ramfs_fallocate ((vnop_fallocate_t)vfscore_vop_nullop)
+#define ramfs_fallocate ((vnop_fallocate_t)vfscore_vop_einval)
 #define ramfs_poll      ((vnop_poll_t)vfscore_vop_einval)
 
 /*

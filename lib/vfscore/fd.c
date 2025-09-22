@@ -34,14 +34,14 @@
 #include <uk/config.h>
 #include <string.h>
 #include <uk/essentials.h>
-#include <uk/bitmap.h>
+#include <uk/bitops/bitmap.h>
 #include <uk/assert.h>
 #include <vfscore/file.h>
 #include <uk/plat/lcpu.h>
 #include <errno.h>
-#if CONFIG_LIBPOSIX_PROCESS_CLONE
+#if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING
 #include <uk/process.h>
-#endif /* CONFIG_LIBPOSIX_PROCESS_CLONE */
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
 
 #include <uk/posix-fdtab-legacy.h>
 
@@ -73,13 +73,20 @@ int fdalloc(struct vfscore_file *fp, int *newfd)
 	return 0;
 }
 
-#if CONFIG_LIBPOSIX_PROCESS_CLONE
-static int uk_posix_clone_files(const struct clone_args *cl_args,
-				size_t cl_args_len __unused,
-				struct uk_thread *child __unused,
-				struct uk_thread *parent __unused)
+#if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING
+static int uk_posix_clone_files(void *arg)
 {
-	if (unlikely(!(cl_args->flags & CLONE_FILES))) {
+	struct posix_process_clone_event_data *event_data;
+	const struct clone_args *cl_args;
+
+	event_data = (struct posix_process_clone_event_data *)arg;
+	UK_ASSERT(event_data);
+
+	cl_args = event_data->cl_args;
+	UK_ASSERT(event_data->cl_args);
+
+	if (unlikely(!(cl_args->flags & CLONE_FILES) &&
+		     !(cl_args->flags & CLONE_VM))) {
 		uk_pr_warn("CLONE_FILES not set");
 		return -ENOTSUP;
 	}
@@ -87,7 +94,8 @@ static int uk_posix_clone_files(const struct clone_args *cl_args,
 	/* CLONE_FILES says that file descriptor table is shared
 	 * with the child, this is what we have implemented at the moment
 	 */
-	return 0;
+	return UK_EVENT_HANDLED_CONT;
 }
-UK_POSIX_CLONE_HANDLER(CLONE_FILES, false, uk_posix_clone_files, 0x0);
-#endif /* CONFIG_LIBPOSIX_PROCESS_CLONE */
+
+POSIX_PROCESS_CLONE_HANDLER(CLONE_FILES, uk_posix_clone_files);
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */

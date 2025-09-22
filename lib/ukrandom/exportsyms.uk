@@ -1,5 +1,3 @@
 getrandom
-uk_syscall_e_getrandom
-uk_syscall_r_getrandom
 uk_random_fill_buffer
 uk_random_init

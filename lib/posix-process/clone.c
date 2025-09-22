@@ -48,217 +48,15 @@
 
 #include "process.h"
 
-/* Up to cl_args->tls, the fields of clone_args are required arguments */
-#define CL_ARGS_REQUIRED_LEN					\
-	(__offsetof(struct clone_args, tls)			\
-	 + sizeof(((struct clone_args *)0)->tls))
-
-extern const struct uk_posix_clonetab_entry _uk_posix_clonetab_start[];
-extern const struct uk_posix_clonetab_entry _uk_posix_clonetab_end;
-
-static __uk_tls struct {
-	bool is_cloned;
-	__u64 cl_flags;
-} cl_status = { false, 0x0 };
-
 #ifdef CONFIG_LIBUKDEBUG_ENABLE_ASSERT
 #define CL_UKTLS_SANITY_MAGIC 0xb0b0f00d /* Bobo food */
 static __thread uint32_t cl_uktls_magic = CL_UKTLS_SANITY_MAGIC;
 #endif /* CONFIG_LIBUKDEBUG_ENABLE_ASSERT */
 
-#define uk_posix_clonetab_foreach(itr)					\
-	for ((itr) = DECONST(struct uk_posix_clonetab_entry*,		\
-			     _uk_posix_clonetab_start);			\
-	     (itr) < &(_uk_posix_clonetab_end);				\
-	     (itr)++)
-
-#define uk_posix_clonetab_foreach_reverse2(itr, start)			\
-	for ((itr) = (start);						\
-	     (itr) >= _uk_posix_clonetab_start;				\
-	     (itr)--)
-
-#define uk_posix_clonetab_foreach_reverse(itr)				\
-	uk_posix_clonetab_foreach_reverse2((itr),			\
-			(DECONST(struct uk_posix_clonetab_entry*,	\
-				 (&_uk_posix_clonetab_end))) - 1)
-
-struct _clonetab_init_call_args {
-	uk_posix_clone_init_func_t init;
-	const struct clone_args *cl_args;
-	size_t cl_args_len;
-	__u64 cl_flags_optional;
-	struct uk_thread *child;
-	struct uk_thread *parent;
-};
-
-static int _clonetab_init_call(void *argp)
-{
-	struct _clonetab_init_call_args *args
-		= (struct _clonetab_init_call_args *) argp;
-	int ret;
-
-	UK_ASSERT(args);
-	UK_ASSERT(args->init);
-
-	ret = (args->init)(args->cl_args, args->cl_args_len,
-			   args->child, args->parent);
-	return ret;
-}
-struct _clonetab_term_call_args {
-	uk_posix_clone_term_func_t term;
-	__u64 cl_flags;
-	struct uk_thread *child;
-};
-
-static int _clonetab_term_call(void *argp)
-{
-	struct _clonetab_term_call_args *args
-		= (struct _clonetab_term_call_args *) argp;
-
-	UK_ASSERT(args);
-	UK_ASSERT(args->term);
-
-	(args->term)(args->cl_flags, args->child);
-	return 0;
-}
-/** Iterates over registered thread initialization functions */
-static int _uk_posix_clonetab_init(const struct clone_args *cl_args,
-				   size_t cl_args_len,
-				   __u64 cl_flags_optional,
-				   struct uk_thread *child,
-				   struct uk_thread *parent)
-{
-	struct uk_posix_clonetab_entry *itr;
-	struct _clonetab_init_call_args init_args;
-	struct _clonetab_term_call_args term_args;
-	int ret = 0;
-	__u64 flags;
-
-	UK_ASSERT(cl_args);
-	UK_ASSERT(cl_args_len >= CL_ARGS_REQUIRED_LEN);
-	UK_ASSERT(child);
-	UK_ASSERT(parent);
-
-	/* Test if we can handle all requested clone flags.
-	 * In case we fail, we do not need to re-wind the operations like as
-	 * we would call the init functions already.
-	 */
-	flags = cl_args->flags;
-	uk_posix_clonetab_foreach(itr) {
-		if (unlikely(!itr->init))
-			continue;
-
-		/* Masked out flags that we can handle */
-		flags &= ~itr->flags_mask;
-	}
-	/* Mask out optional flags:
-	 * We should not fail if we can't handle those
-	 */
-	flags &= ~cl_flags_optional;
-
-	if (flags != 0x0) {
-		uk_pr_warn("posix_clone %p (%s): Unsupported clone flags requested: 0x%"__PRIx64"\n",
-			   child, child->name ? child->name : "<unnamed>",
-			   flags);
-		ret = -ENOTSUP;
-		goto out;
-	}
-
-	/* Call handlers according to clone flags */
-	init_args.cl_args     = cl_args;
-	init_args.cl_args_len = cl_args_len;
-	init_args.child       = child;
-	init_args.parent      = parent;
-	uk_posix_clonetab_foreach(itr) {
-		if (unlikely(!itr->init))
-			continue;
-		if (itr->presence_only && !(cl_args->flags & itr->flags_mask))
-			continue;
-
-		uk_pr_debug("posix_clone %p (%s) init: Call initialization %p() [flags: 0x%"__PRIx64"]...\n",
-			    child, child->name ? child->name : "<unnamed>",
-			    *itr->init, itr->flags_mask);
-
-		/* NOTE: We call the init function with the Unikraft TLS of the
-		 *       created child in order to enable TLS initializations.
-		 */
-		init_args.init = *itr->init;
-		ret = ukplat_tlsp_exec(child->uktlsp, _clonetab_init_call,
-				       &init_args);
-		if (ret < 0) {
-			uk_pr_debug("posix_clone %p (%s) init: %p() returned %d\n",
-				    child,
-				    child->name ? child->name : "<unnamed>",
-				    *itr->init, ret);
-			goto err;
-		}
-	}
-
-	/* Set status in the child (TLS variable) */
-	uk_thread_uktls_var(child, cl_status.is_cloned) = true;
-	uk_thread_uktls_var(child, cl_status.cl_flags)  = cl_args->flags;
-	ret = 0; /* success */
-	goto out;
-
-err:
-	/* Run termination functions starting from one level before the failed
-	 * one for cleanup (also with child TLS context)
-	 */
-	term_args.cl_flags = cl_args->flags;
-	term_args.child   = child;
-	uk_posix_clonetab_foreach_reverse2(itr, itr - 2) {
-		if (unlikely(!itr->term))
-			continue;
-		if (itr->presence_only && !(cl_args->flags & itr->flags_mask))
-			continue;
-
-		uk_pr_debug("posix_clone %p (%s) init: Call termination %p() [flags: 0x%"__PRIx64"]...\n",
-			    child, child->name ? child->name : "<unnamed>",
-			    *itr->term, itr->flags_mask);
-		term_args.term = itr->term;
-		ukplat_tlsp_exec(child->uktlsp, _clonetab_term_call,
-				 &term_args);
-	}
-out:
-	return ret;
-}
-
-/** Iterates over registered clone termination functions for threads that
- *  were created with clone
- * NOTE: This function is called from child TLS context
- */
-static void uk_posix_clonetab_term(struct uk_thread *child)
-{
-	struct uk_posix_clonetab_entry *itr;
-
-	UK_ASSERT(child);
-	UK_ASSERT(ukplat_tlsp_get() == child->uktlsp);
-
-	/* Only if this thread was cloned, call the clone termination callbacks
-	 */
-	if (!cl_status.is_cloned)
-		return;
-
-	/* Go over clone termination functions that match with
-	 * child's ECTX and UKTLS feature requirements
-	 */
-	uk_posix_clonetab_foreach_reverse(itr) {
-		if (unlikely(!itr->term))
-			continue;
-		if (itr->presence_only &&
-		    !(cl_status.cl_flags & itr->flags_mask))
-			continue;
-
-		uk_pr_debug("posix_clone %p (%s) term: Call termination %p() [flags: 0x%"__PRIx64"]...\n",
-			    child, child->name ? child->name : "<unnamed>",
-			    *itr->term, itr->flags_mask);
-		(itr->term)(cl_status.cl_flags, child);
-	}
-
-	cl_status.is_cloned = false;
-	cl_status.cl_flags = 0x0;
-}
-UK_THREAD_INIT_PRIO(0x0, uk_posix_clonetab_term, UK_PRIO_LATEST);
+/* Up to cl_args->tls, the fields of clone_args are required arguments */
+#define CL_ARGS_REQUIRED_LEN					\
+	(__offsetof(struct clone_args, tls)			\
+	 + sizeof(((struct clone_args *)0)->tls))
 
 /*
  * NOTE: From man pages about clone(2)
@@ -310,24 +108,32 @@ static void _clone_child_gc(struct uk_thread *t)
 /*
  * NOTE: The clone system call and the handling of the TLS
  *
- *       `_clone()` assumes that a passed TLS pointer is an Unikraft TLS.
- *       The only exception exists if `_clone()` is called from a context
+ *       `uk_clone()` assumes that a passed TLS pointer is an Unikraft TLS.
+ *       The only exception exists if `uk_clone()` is called from a context
  *       where a custom TLS is already active (depends on
  *       `CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS`). In such a case, an
  *       Unikraft TLS is allocated but the passed TLS pointer is activated.
  *       The reason is that Unikraft libraries place TLS variables and use
  *       the TLS effectively as TCB.
- *       In case no TLS is handed over (CLONE_SETTLS is not set), _clone will
+ *       In case no TLS is handed over (CLONE_SETTLS is not set), uk_clone will
  *       still allocate an Unikraft TLS but sets the TLS architecture pointer
  *       to zero.
  */
-static int _clone(struct clone_args *cl_args, size_t cl_args_len,
-		  struct ukarch_execenv *execenv)
+int uk_clone(struct clone_args *cl_args, size_t cl_args_len,
+	     struct ukarch_execenv *execenv)
 {
+	struct posix_process_clone_event_data clone_event;
+	struct posix_process *pprocess;
+	struct posix_thread *pthread;
 	struct uk_thread *child = NULL;
 	struct uk_thread *t;
 	struct uk_sched *s;
+	pid_t child_tid;
+	pid_t child_pid;
+	__u64 stack_size;
+	__u64 stack;
 	__u64 flags;
+	__u64 tls;
 	int ret;
 
 	t = uk_thread_current();
@@ -345,7 +151,13 @@ static int _clone(struct clone_args *cl_args, size_t cl_args_len,
 		goto err_out;
 	}
 
+	/* shadow cl_args that may be modified
+	 * by this function into locals
+	 */
+	stack_size = cl_args->stack_size;
+	stack = cl_args->stack;
 	flags = cl_args->flags;
+	tls = cl_args->tls;
 
 #if UK_DEBUG
 	uk_pr_debug("uk_syscall_r_clone(\n");
@@ -382,11 +194,53 @@ static int _clone(struct clone_args *cl_args, size_t cl_args_len,
 		uk_pr_debug(" parent_tid: %p\n", (void *)cl_args->parent_tid);
 	if (flags & (CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID))
 		uk_pr_debug(" child_tid: %p\n", (void *)cl_args->child_tid);
-	uk_pr_debug(" stack: %p\n", (void *)cl_args->stack);
-	uk_pr_debug(" tls: %p\n", (void *)cl_args->tls);
+	uk_pr_debug(" stack: %p\n", (void *)stack);
+	uk_pr_debug(" tls: %p\n", (void *)tls);
 	uk_pr_debug(" <return>: %p\n", (void *)execenv->regs.rip);
 	uk_pr_debug(")\n");
 #endif /* UK_DEBUG */
+
+#if !CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS
+	if (unlikely(flags & !CLONE_THREAD)) {
+		uk_pr_err("Multiprocess support not enabled\n");
+		return -ENOTSUP;
+	}
+#endif /* !CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
+
+	if (unlikely(!(flags & CLONE_VM))) {
+		uk_pr_err("CLONE_VM not set: Multiple address spaces are not supported\n");
+		return -ENOTSUP;
+	}
+
+	if (unlikely(flags & CLONE_CHILD_SETTID && !cl_args->child_tid))
+		return -EINVAL;
+
+	if (unlikely(flags & CLONE_PARENT_SETTID && !cl_args->parent_tid))
+		return -EINVAL;
+
+	if (unlikely(flags & CLONE_DETACHED))
+		uk_pr_warn("Ignoring historical CLONE_DETACHED\n");
+
+	/* CLONE_VM requires that the child operates on the same memory
+	 * space as the parent.
+	 *
+	 * Assign the parent's stack. We assign the user TLS to the
+	 * parent's in clone_setup_child_ctx(). We copy the registers
+	 * later below.
+	 */
+	if (flags & CLONE_VM) {
+		if (!stack && !stack_size) {
+			stack = ukarch_regs_get_sp(&execenv->regs);
+			uk_pr_debug("Using parent's sp @ 0x%lx\n",
+				    stack);
+		}
+
+		if (!tls) {
+			tls = ukarch_sysctx_get_tlsp(&execenv->sysctx);
+			uk_pr_debug("Using parent's tls @ 0x%lx\n",
+				    tls);
+		}
+	}
 
 	if ((flags & CLONE_SETTLS)
 #if CONFIG_LIBSYSCALL_SHIM_HANDLER_ULTLS
@@ -398,12 +252,12 @@ static int _clone(struct clone_args *cl_args, size_t cl_args_len,
 		 * Unikraft TLS.
 		 */
 		uk_pr_debug("Using passed TLS pointer %p as an Unikraft TLS\n",
-			    (void *) cl_args->tls);
+			    (void *)tls);
 		child = uk_thread_create_container2(s->a,
-						    (__uptr) cl_args->stack,
+						    (__uptr)stack,
 						    s->a_auxstack,
 						    AUXSTACK_SIZE,
-						    (__uptr) cl_args->tls,
+						    (__uptr)tls,
 						    true, /* TLS is an UKTLS */
 						    false, /* We want ECTX */
 						    (t->name) ? strdup(t->name)
@@ -446,43 +300,132 @@ static int _clone(struct clone_args *cl_args, size_t cl_args_len,
 		  == CL_UKTLS_SANITY_MAGIC);
 #endif /* CONFIG_LIBUKDEBUG_ENABLE_ASSERT */
 
-	/* CLONE_SETTLS: Instead of just activating the Unikraft TLS, we
-	 * activate the passed TLS pointer as soon as the child wakes up.
-	 * NOTE: If SETTLS is not set, we do not activate any TLS although
-	 *       an Unikraft TLS was allocated.
-	 */
-	child->tlsp = (flags & CLONE_SETTLS) ? cl_args->tls : 0x0;
+	if (flags & CLONE_VFORK) {
+#if CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS
+		/* We will be blocking the parent and pass control to the child
+		 * via the scheduler. Therefore we need to set the child's TLS
+		 * pointer the Unikraft TLS.
+		 */
+		child->tlsp = child->uktlsp;
+
+		/* Since we didn't specify a stack to
+		 * uk_thread_create_container2() above,
+		 * we need to assign the stack manually.
+		 */
+		child->_mem.stack = (void *)stack;
+
+		/* Also inherit the parent's stack allocator */
+		child->_mem.stack_a = t->_mem.stack_a;
+#else /* CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
+		ret = -ENOTSUP;
+		goto err_free_child;
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
+	} else  {
+		/* CLONE_SETTLS: Instead of just activating the Unikraft TLS
+		 * we activate the passed TLS pointer as soon as the child
+		 * wakes up.
+		 * NOTE: If SETTLS is not set, we do not activate any TLS
+		 * although a Unikraft TLS was allocated.
+		 */
+		if ((flags & CLONE_SETTLS))
+			child->tlsp = tls;
+		else
+			child->tlsp = 0;
+	}
+
 	uk_pr_debug("Child is going to wake up with TLS pointer set to: %p (%s TLS)\n",
 		    (void *) child->tlsp,
 		    (child->tlsp != child->uktlsp) ? "custom" : "Unikraft");
 
-	/* Call clone handler table but treat CLONE_SETTLS as handled */
-	ret = _uk_posix_clonetab_init(cl_args, cl_args_len,
-				      CLONE_SETTLS,
-				      child, t);
-	if (ret < 0)
+	pprocess = uk_pprocess_current();
+	UK_ASSERT(pprocess);
+
+	if (cl_args->flags & CLONE_THREAD) {
+		pthread = pprocess_create_pthread(pprocess, child);
+		if (unlikely(PTRISERR(pthread))) {
+			ret = PTR2ERR(pthread);
+			uk_pr_err("Could not create pthread (%d)\n", ret);
+			goto err_free_child;
+		}
+	} else {
+#if CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS
+		ret = pprocess_create(uk_alloc_get_default(), child, t);
+		if (unlikely(ret)) {
+			uk_pr_err("Could not create process (%d)\n", ret);
+			goto err_free_child;
+		}
+#else /* CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
+		ret = -ENOTSUP;
 		goto err_free_child;
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
+	}
+	child_tid = ukthread2tid(child);
+	child_pid = ukthread2pid(child);
+
+	/* Raise clone event */
+	clone_event = (struct posix_process_clone_event_data) {
+		.cl_args = cl_args,
+		.cl_args_len = cl_args_len,
+		.child = child,
+		.parent = t,
+		.ppid = pprocess->pid,
+		.pid = child_pid,
+		.tid = child_tid,
+	};
+	ret = pprocess_raise_clone_event(&clone_event);
+	if (unlikely(ret < 0))
+		goto err_free_child;
+
 	uk_pr_debug("Thread cloned %p (%s) -> %p (%s): %d\n",
 		    t, t->name ? child->name : "<unnamed>",
 		    child, child->name ? child->name : "<unnamed>", ret);
 
-	clone_setup_child_ctx(execenv, child, (__uptr)cl_args->stack);
+	clone_setup_child_ctx(execenv, child, (__uptr)stack);
 
 	uk_thread_set_runnable(child);
 
-	/* We will return the child's thread ID in the parent */
-	ret = ukthread2tid(child);
-
 	/* Assign the child to the scheduler */
-	uk_sched_thread_add(s, child);
+	ret = uk_sched_thread_add(s, child);
+	if (unlikely(ret)) {
+		uk_pr_err("Unable to add tid %d to scheduler (%d)\n",
+			  child_tid, ret);
+		goto err_free_child;
+	}
+
+	/* Can't fail past this point, update user parameters */
+	if (flags & CLONE_CHILD_SETTID)
+		*((pid_t *)cl_args->child_tid) = child_tid;
+
+	if (flags & CLONE_PARENT_SETTID)
+		*((pid_t *)cl_args->parent_tid) = child_tid;
+
+	/* Set the return value depending on whether
+	 * a thread or a process is created.
+	 */
+	if (cl_args->flags & CLONE_THREAD)
+		ret = child_tid;
+	else
+		ret = child_pid;
+
+	/* CLONE_VFORK: Block the parent until the child calls execve()
+	 * or exit(). Yield to schedule the child.
+	 */
+	if (flags & CLONE_VFORK) {
+		pthread = tid2pthread(ukthread2tid(t));
+		uk_thread_block(t);
+		pthread->state = POSIX_THREAD_BLOCKED_VFORK;
+		uk_sched_yield();
+		goto out;
+	}
 
 #ifdef CONFIG_LIBPOSIX_PROCESS_CLONE_PREFER_CHILD
 	uk_sched_yield();
 #endif /* CONFIG_LIBPOSIX_PROCESS_CLONE_PREFER_CHILD */
-
+out:
 	return ret;
 
 err_free_child:
+	/* also issues exit events */
 	uk_thread_release(child);
 err_out:
 	return ret;
@@ -515,47 +458,5 @@ UK_LLSYSCALL_R_E_DEFINE(int, clone,
 		.tls         = (__u64) tlsp
 	};
 
-	return _clone(&cl_args, sizeof(cl_args), execenv);
+	return uk_clone(&cl_args, sizeof(cl_args), execenv);
 }
-
-#if UK_LIBC_SYSCALLS
-int clone(int (*fn)(void *) __unused, void *sp __unused,
-	  int flags __unused, void *arg __unused,
-	  ... /* pid_t *parent_tid, void *tls, pid_t *child_tid */)
-{
-	/* TODO */
-	errno = EINVAL;
-	return -1;
-}
-#endif /* UK_LIBC_SYSCALLS */
-
-/*
- * Checks that the CLONE_VM is set so that we make sure that
- * the address space is shared. Unikraft does currently not support
- * multiple application address spaces.
- */
-static int uk_posix_clone_checkvm(const struct clone_args *cl_args,
-				  size_t cl_args_len __unused,
-				  struct uk_thread *child __unused,
-				  struct uk_thread *parent __unused)
-{
-	if (!(cl_args->flags & CLONE_VM)) {
-		uk_pr_warn("Cloning thread without CLONE_VM being set: Creating of new address spaces are currently not supported.\n");
-		return -ENOTSUP;
-	}
-	return 0;
-}
-UK_POSIX_CLONE_HANDLER(CLONE_VM, false, uk_posix_clone_checkvm, 0x0);
-
-/*
- * Ignore historical CLONE_DETACHED flag
- */
-static int uk_posix_clone_detached(const struct clone_args *cl_args __unused,
-				   size_t cl_args_len __unused,
-				   struct uk_thread *child __unused,
-				   struct uk_thread *parent __unused)
-{
-	uk_pr_debug("Ignoring historical CLONE_DETACHED\n");
-	return 0;
-}
-UK_POSIX_CLONE_HANDLER(CLONE_DETACHED, false, uk_posix_clone_detached, 0x0);

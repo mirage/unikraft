@@ -39,6 +39,10 @@
 #include <uk/essentials.h>
 #include <uk/prio.h>
 
+#if CONFIG_LIBUKSCHED
+#include <uk/thread.h>
+#endif /* CONFIG_LIBUKSCHED */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,18 +52,26 @@ struct uk_init_ctx {
 		int    argc;
 		char **argv;
 	} cmdline;
+#if CONFIG_LIBUKSCHED
+	/* Set if main() executes on a separate thread,
+	 * otherwise NULL.
+	 */
+	struct uk_thread *tmain;
+#endif /* CONFIG_LIBUKSCHED */
 
 	/* reserved for future additions */
 };
 
 struct uk_term_ctx {
 	enum ukplat_gstate target;
+	/* Application exit code */
+	int exit_code;
 
 	/* reserved for future additions */
 };
 
 typedef int (*uk_init_func_t)(struct uk_init_ctx *);
-typedef void (*uk_term_func_t)(const struct uk_term_ctx *);
+typedef void (*uk_term_func_t)(struct uk_term_ctx *);
 
 struct uk_inittab_entry {
 	uk_init_func_t init;

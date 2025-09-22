@@ -124,3 +124,6 @@ config FPSIMD
 #        only allow a single platform (including external platforms).
 comment "Warning: Selecting multiple platforms is unsupported!"
 	depends on PLAT_KVM && PLAT_XEN
+
+config HAVE_SHUTDOWN_DISPATCHER
+	bool

@@ -1,8 +1,10 @@
 /* taken from musl */
 
-#include <uk/essentials.h>
+#define _GNU_SOURCE
 #include <string.h>
 #include <signal.h>
+
+#include <uk/essentials.h>
 
 /*
  * TODO: not used - delete

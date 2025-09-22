@@ -41,6 +41,7 @@ extern "C" {
 #endif
 
 #define __NEED_NULL
+#define __NEED_pid_t
 #define __NEED_size_t
 #define __NEED_ssize_t
 #define __NEED_off_t
@@ -83,6 +84,7 @@ int execvpe(const char *file, char *const argv[],
 		char *const envp[]);
 int execve(const char *filename, char *const argv[],
 		char *const envp[]);
+pid_t vfork(void);
 #endif
 
 #if CONFIG_LIBVFSCORE
@@ -115,8 +117,22 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t pread(int fd, void *buf, size_t count, off_t offset);
 int fsync(int fd);
+int fdatasync(int fd);
 off_t lseek(int fd, off_t offset, int whence);
+int ftruncate(int fd, off_t length);
 #endif /* CONFIG_LIBPOSIX_FDIO */
+
+#if CONFIG_LIBPOSIX_VFS_SYSCALLS
+void sync(void);
+int unlink(const char *pathname);
+int chdir(const char *path);
+int fchdir(int fd);
+int chroot(const char *path);
+int rmdir(const char *pathname);
+char *getcwd(char *buf, size_t size);
+int symlink(const char *path, const char *linkpath);
+int truncate(const char *path, off_t length);
+#endif /* CONFIG_LIBPOSIX_VFS_SYSCALLS */
 #endif /* CONFIG_LIBPOSIX_FDTAB */
 
 #endif /* !CONFIG_LIBVFSCORE */

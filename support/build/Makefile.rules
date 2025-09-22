@@ -1021,10 +1021,15 @@ $(call libname2preolib,$(1)): $$($(call vprefix_lib,$(1),OBJS)) \
 
 $(call libname2olib,$(1)): $(call libname2preolib,$(1)) \
 			   $$($(call vprefix_lib,$(1),EXPORTS)) $$($(call vprefix_lib,$(1),EXPORTS-y)) \
+			   $$(EACHOLIB_EXPORTS) $$(EACHOLIB_EXPORTS-y) \
 			   $$($(call vprefix_lib,$(1),LOCALS)) $$($(call vprefix_lib,$(1),LOCALS-y)) \
 			   $$(EACHOLIB_LOCALS) $$(EACHOLIB_LOCALS-y)
 	$(call build_cmd,OBJCOPY,,$(call libname2olib,$(1)),\
-		$(OBJCOPY) $$(addprefix --keep-global-symbols=,$$($(call vprefix_lib,$(1),EXPORTS)) $$($(call vprefix_lib,$(1),EXPORTS-y))) \
+		$(OBJCOPY) \
+			   $$(addprefix --keep-global-symbols=,$$($(call vprefix_lib,$(1),EXPORTS)) $$($(call vprefix_lib,$(1),EXPORTS-y))) \
+			   $$(if \
+				$$(and $$(strip $$($(call vprefix_lib,$(1),EXPORTS)) $$($(call vprefix_lib,$(1),EXPORTS-y))), $$(strip $$(EACHOLIB_EXPORTS) $$(EACHOLIB_EXPORTS-y))), \
+				$$(addprefix --keep-global-symbols=,$$(EACHOLIB_EXPORTS) $$(EACHOLIB_EXPORTS-y))) \
 			   $$(addprefix --localize-symbols=,$$($(call vprefix_lib,$(1),LOCALS)) $$($(call vprefix_lib,$(1),LOCALS-y))) \
 			   $$(addprefix --localize-symbols=,$$(EACHOLIB_LOCALS) $$(EACHOLIB_LOCALS-y)) \
 		           $$(OBJCFLAGS) $$(OBJCFLAGS-y) \

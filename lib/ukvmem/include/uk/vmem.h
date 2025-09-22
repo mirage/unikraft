@@ -129,6 +129,16 @@ struct uk_vma {
 	const char *name;
 };
 
+/**
+ * Returns the length of a VMA in bytes.
+ */
+static inline __sz uk_vma_len(struct uk_vma *vma)
+{
+	UK_ASSERT(vma->end > vma->start);
+
+	return vma->end - vma->start;
+}
+
 /** Page fault context */
 struct uk_vm_fault {
 	/** Faulting virtual address */
@@ -669,6 +679,6 @@ int uk_vma_advise(struct uk_vas *vas, __vaddr_t vaddr, __sz len,
 }
 #endif
 
-#include <uk/vma_types.h>
+#include <uk/vmem/vma_types.h>
 
 #endif /* __UK_VMEM_H__ */

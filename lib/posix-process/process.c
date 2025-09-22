@@ -1,38 +1,13 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * Authors: Simon Kuenzer <simon.kuenzer@neclab.eu>
- *          Felipe Huici <felipe.huici@neclab.eu>
- *          Costin Lupu <costin.lupu@cs.pub.ro>
- *
  * Copyright (c) 2017, NEC Europe Ltd., NEC Corporation. All rights reserved.
  * Copyright (c) 2022, NEC Laboratories Europe GmbH, NEC Corporation.
  *                     All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Copyright (c) 2024, Unikraft GmbH and The Unikraft Authors.
+ * Licensed under the BSD-3-Clause License (the "License").
+ * You may not use this file except in compliance with the License.
  */
+
 #include <uk/config.h>
 #include <sys/types.h>
 #include <stddef.h>
@@ -40,10 +15,12 @@
 #include <uk/config.h>
 #include <uk/syscall.h>
 
-#define TIDMAP_SIZE (CONFIG_LIBPOSIX_PROCESS_MAX_PID + 1)
+struct uk_thread *pprocess_thread_main;
 
-#if CONFIG_LIBPOSIX_PROCESS_PIDS
-#include <uk/bitmap.h>
+#if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING
+#include <signal.h> /* SIGCHLD */
+
+#include <uk/bitops/bitmap.h>
 #include <uk/list.h>
 #include <uk/alloc.h>
 #include <uk/sched.h>
@@ -51,35 +28,14 @@
 #include <uk/init.h>
 #include <uk/errptr.h>
 #include <uk/essentials.h>
-#if CONFIG_LIBPOSIX_PROCESS_CLONE
+#include <uk/plat/config.h>
 #include <uk/process.h>
-#endif /* CONFIG_LIBPOSIX_PROCESS_CLONE */
+
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+#include "signal/signal.h"
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
 
 #include "process.h"
-
-/**
- * Internal structures
- */
-struct posix_process {
-	pid_t pid;
-	struct posix_process *parent;
-	struct uk_list_head children; /* child processes */
-	struct uk_list_head child_list_entry;
-	struct uk_list_head threads;
-	struct uk_alloc *_a;
-
-	/* TODO: Mutex */
-};
-
-struct posix_thread {
-	pid_t tid;
-	struct posix_process *process;
-	struct uk_list_head thread_list_entry;
-	struct uk_thread *thread;
-	struct uk_alloc *_a;
-
-	/* TODO: Mutex */
-};
 
 /**
  * System global lists
@@ -89,10 +45,13 @@ struct posix_thread {
 static struct posix_thread *tid_thread[TIDMAP_SIZE];
 static unsigned long tid_map[UK_BITS_TO_LONGS(TIDMAP_SIZE)] = { [0] = 0x01UL };
 
+/* Process Table */
+struct posix_process *pid_process[TIDMAP_SIZE];
+
 /**
  * Thread-local posix_thread reference
  */
-static __uk_tls struct posix_thread *pthread_self = NULL;
+__uk_tls struct posix_thread *pthread_self = NULL;
 
 /**
  * Helpers to find and reserve a `pid_t`
@@ -139,8 +98,8 @@ static void release_tid(pid_t tid)
 }
 
 /* Allocate a thread for a process */
-static struct posix_thread *pprocess_create_pthread(
-			struct posix_process *pprocess, struct uk_thread *th)
+struct posix_thread *pprocess_create_pthread(struct posix_process *pprocess,
+					     struct uk_thread *th)
 {
 	struct posix_thread *pthread;
 	struct uk_alloc *a;
@@ -154,25 +113,52 @@ static struct posix_thread *pprocess_create_pthread(
 	a = pprocess->_a;
 
 	tid = find_and_reserve_tid();
-	if (tid < 0) {
-		err = EAGAIN;
+	if (unlikely(tid < 0)) {
+		err = -EAGAIN;
 		goto err_out;
 	}
 
 	pthread = uk_zalloc(a, sizeof(*pthread));
-	if (!pthread) {
-		err = ENOMEM;
+	if (unlikely(!pthread)) {
+		err = -ENOMEM;
 		goto err_free_tid;
 	}
 
 	pthread->_a = a;
 	pthread->process = pprocess;
+	pthread->parent = uk_pthread_current();
 	pthread->tid = tid;
 	pthread->thread = th;
-	uk_list_add_tail(&pthread->thread_list_entry, &pprocess->threads);
+
+	uk_thread_uktls_var(th, pthread_self) = pthread;
+
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+	err = pprocess_signal_tdesc_alloc(pthread);
+	if (unlikely(err)) {
+		uk_pr_err("Could not allocate signal descriptor\n");
+		/* Handle rollback manually to avoid adding more
+		 * signal conditionals.
+		 */
+		uk_free(a, pthread);
+		goto err_free_tid;
+	}
+	err = pprocess_signal_tdesc_init(pthread);
+	if (unlikely(err)) {
+		uk_pr_err("Could not initialize signal descriptor\n");
+		/* Handle rollback manually to avoid adding more
+		 * signal conditionals.
+		 */
+		pprocess_signal_tdesc_free(pthread);
+		uk_free(a, pthread);
+		goto err_free_tid;
+	}
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
 
 	/* Store reference to pthread with TID */
 	tid_thread[tid] = pthread;
+
+	/* Add to parent's list of threads */
+	uk_list_add_tail(&pthread->thread_list_entry, &pprocess->threads);
 
 	uk_pr_debug("Process PID %d: New thread TID %d\n",
 		    (int) pprocess->pid, (int) pthread->tid);
@@ -181,17 +167,27 @@ static struct posix_thread *pprocess_create_pthread(
 err_free_tid:
 	release_tid(tid);
 err_out:
-	return ERR2PTR(-err);
+	return ERR2PTR(err);
 }
 
 /* Free thread that is part of a process
- * NOTE: The process is not free'd here when its thread list
+ * NOTE: The process is not released here when its thread list
  *       becomes empty.
  */
-static void pprocess_release_pthread(struct posix_thread *pthread)
+void pprocess_release_pthread(struct posix_thread *pthread)
 {
 	UK_ASSERT(pthread);
 	UK_ASSERT(pthread->_a);
+	UK_ASSERT(pthread->process);
+
+	uk_pr_debug("pid %d: Release tid %d\n",
+		    pthread->process->pid, pthread->tid);
+
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+	pprocess_signal_tdesc_free(pthread);
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
+
+	uk_thread_uktls_var(pthread->thread, pthread_self) = NULL;
 
 	/* remove from process' thread list */
 	uk_list_del_init(&pthread->thread_list_entry);
@@ -204,12 +200,25 @@ static void pprocess_release_pthread(struct posix_thread *pthread)
 	uk_free(pthread->_a, pthread);
 }
 
-static void pprocess_release(struct posix_process *pprocess);
+int uk_posix_process_create_pthread(struct uk_thread *thread)
+{
+	struct posix_process *pprocess;
+	struct posix_thread *pthread;
+
+	pprocess = uk_pprocess_current();
+	UK_ASSERT(pprocess);
+
+	pthread = pprocess_create_pthread(pprocess, thread);
+	if (unlikely(PTRISERR(pthread)))
+		return PTR2ERR(pthread);
+
+	return 0;
+}
 
 /* Create a new posix process for a given thread */
-int uk_posix_process_create(struct uk_alloc *a,
-			    struct uk_thread *thread,
-			    struct uk_thread *parent)
+int pprocess_create(struct uk_alloc *a,
+		    struct uk_thread *thread,
+		    struct uk_thread *parent)
 {
 	struct posix_thread  *parent_pthread  = NULL;
 	struct posix_process *parent_pprocess = NULL;
@@ -245,6 +254,28 @@ int uk_posix_process_create(struct uk_alloc *a,
 	UK_INIT_LIST_HEAD(&pprocess->threads);
 	UK_INIT_LIST_HEAD(&pprocess->children);
 
+	pprocess->state = POSIX_PROCESS_RUNNING;
+
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+	ret = pprocess_signal_pdesc_alloc(pprocess);
+	if (unlikely(ret)) {
+		uk_pr_err("Could not allocate signal descriptor\n");
+		/* Free manually as we can jump to err_free_pprocess
+		 * after this allocation is successful.
+		 */
+		uk_free(a, pprocess);
+		goto err_out;
+	}
+	ret = pprocess_signal_pdesc_init(pprocess);
+	if (unlikely(ret)) {
+		uk_pr_err("Could not initialize signal descriptor\n");
+		goto err_free_pprocess;
+	}
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
+
+	uk_semaphore_init(&pprocess->wait_semaphore, 0);
+	uk_semaphore_init(&pprocess->exit_semaphore, 0);
+
 	/* Check if we have a pthread structure already for this thread
 	 * or if we need to allocate one
 	 */
@@ -271,9 +302,27 @@ int uk_posix_process_create(struct uk_alloc *a,
 		uk_list_add_tail(&(*pthread)->thread_list_entry,
 				 &pprocess->threads);
 
+		/* Update parent */
+		(*pthread)->parent = parent_pthread;
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+		/* Reset signal state of this thread */
+		ret = pprocess_signal_tdesc_init(*pthread);
+		if (unlikely(ret)) {
+			uk_pr_err("Could not initialize signal descriptor\n");
+			goto err_free_pprocess;
+		}
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
+
 		/* Release original process if it became empty of threads */
 		if (uk_list_empty(&orig_pprocess->threads))
 			pprocess_release(orig_pprocess);
+	}
+
+	/* Add to process table. No failure past this point. */
+	if (unlikely((unsigned long)pprocess->pid >= ARRAY_SIZE(pid_process))) {
+		uk_pr_err("Process limit reached, could not create new process\n");
+		ret = -EAGAIN;
+		goto err_free_pprocess;
 	}
 
 	pprocess->parent = parent_pprocess;
@@ -281,6 +330,7 @@ int uk_posix_process_create(struct uk_alloc *a,
 		uk_list_add_tail(&pprocess->child_list_entry,
 				 &parent_pprocess->children);
 	}
+	pid_process[pprocess->pid] = pprocess;
 
 	uk_pr_debug("Process PID %d created (parent PID: %d)\n",
 		    (int) pprocess->pid,
@@ -288,187 +338,215 @@ int uk_posix_process_create(struct uk_alloc *a,
 	return 0;
 
 err_free_pprocess:
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+	pprocess_signal_pdesc_free(pprocess);
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
 	uk_free(a, pprocess);
 err_out:
 	return ret;
 }
 
-/* Releases pprocess memory and re-links its child to the parent
- * NOTE: All related threads must be removed already from this pprocess
+#if CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS
+pid_t uk_posix_process_run(uk_posix_process_mainlike_func fn,
+			   int argc, const char *argv[])
+{
+	struct posix_process_execve_event_data execve_data;
+	struct posix_process_clone_event_data clone_data;
+	struct uk_sched *s = uk_sched_current();
+	struct clone_args cl_args;
+	struct uk_thread *parent;
+	struct uk_thread *child;
+	pid_t parent_tid;
+	pid_t child_tid;
+	int ret;
+
+	UK_ASSERT(s);
+
+	parent = uk_thread_current();
+	parent_tid = ukthread2tid(parent);
+	UK_ASSERT(parent_tid > 0);
+
+	/* Create container thread */
+	child = uk_thread_create_container(uk_alloc_get_default(),
+					   s->a_stack,
+					   STACK_SIZE,
+					   s->a_auxstack, 0, s->a_uktls,
+					   false, "application", NULL, NULL);
+	if (unlikely(!child)) {
+		uk_pr_err("Could not create thread\n");
+		return -ENOMEM;
+	}
+
+	/* Create new process */
+	ret = pprocess_create(uk_alloc_get_default(), child, parent);
+	if (unlikely(ret)) {
+		uk_pr_err("Could not create process (%d)\n", ret);
+		goto err_free_thread;
+	}
+	child_tid = ukthread2tid(child);
+
+	/* Raise the clone event. We pass the flags used when creating
+	 * a new process, i.e. CLONE_VM | CLONE_VFORK | SIGCHLD.
+	 */
+	cl_args = (struct clone_args) {
+		.flags       = CLONE_VM | CLONE_VFORK,
+		.child_tid   = child_tid,
+		.parent_tid  = parent_tid,
+		.exit_signal = SIGCHLD,
+	};
+
+	clone_data = (struct posix_process_clone_event_data) {
+		.cl_args = &cl_args,
+		.cl_args_len = sizeof(cl_args),
+		.child = child,
+		.parent = parent,
+		.ppid = ukthread2pid(parent),
+		.pid = ukthread2pid(child),
+		.tid = child_tid,
+	};
+
+	ret = pprocess_raise_clone_event(&clone_data);
+	if (unlikely(ret < 0)) {
+		uk_pr_err("clone event error (%d)\n", ret);
+		goto err_free_thread;
+	}
+
+	/* Raise the execve event */
+	execve_data = (struct posix_process_execve_event_data) {
+		.thread = child,
+		.tid = ukthread2tid(child),
+		.pid = ukthread2pid(child),
+	};
+	ret = pprocess_raise_execve_event(&execve_data);
+	if (unlikely(ret < 0)) {
+		uk_pr_err("exeve event error (%d)\n", ret);
+		goto err_free_thread;
+	}
+
+	/* Schedule the process */
+	uk_thread_container_init_fn2(child,
+				     (uk_thread_fn2_t)fn,
+				     (void *)(unsigned long)argc,
+				     (void *)argv);
+	ret = uk_sched_thread_add(s, child);
+	if (unlikely(ret < 0)) {
+		uk_pr_err("Unable to add tid %d to scheduler (%d)\n",
+			  ukthread2tid(child), ret);
+		goto err_free_thread;
+	}
+
+	return ukthread2pid(child);
+
+err_free_thread:
+	/* also issues exit events */
+	uk_thread_release(child);
+
+	return ret;
+}
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTIPROCESS */
+
+/* Releases pprocess memory and other resources.
+ * NOTE: All pthreads must be removed already
+ *       from this pprocess. All chilren must
+ *       be already reparented.
  */
-static void pprocess_release(struct posix_process *pprocess)
+void pprocess_release(struct posix_process *pprocess)
 {
-	struct posix_process *pchild, *pchildn;
+	pid_t pid;
 
+	UK_ASSERT(pprocess);
 	UK_ASSERT(uk_list_empty(&pprocess->threads));
+	UK_ASSERT(uk_list_empty(&pprocess->children));
 
-	uk_list_for_each_entry_safe(pchild, pchildn,
-				    &pprocess->children,
-				    child_list_entry) {
-		/* check for violation of the tree structure */
-		UK_ASSERT(pchild != pprocess);
+	/* Unlink this process from its parent */
+	if (pprocess->parent)
+		uk_list_del(&pprocess->child_list_entry);
 
-		uk_list_del(&pchild->child_list_entry);
-		if (pprocess->parent) {
-			pchild->parent = pprocess->parent;
-			uk_list_add(&pchild->child_list_entry,
-				    &pprocess->parent->children);
-			uk_pr_debug("Process PID %d re-assigned to parent PID %d\n",
-				    pchild->pid, pprocess->parent->pid);
-		} else {
-			/* There is no parent, disconnect */
-			pchild->parent = NULL;
-			uk_pr_debug("Process PID %d loses its parent\n",
-				    pchild->pid);
-		}
-	}
+#if CONFIG_LIBPOSIX_PROCESS_SIGNAL
+	pprocess_signal_pdesc_free(pprocess);
+#endif /* CONFIG_LIBPOSIX_PROCESS_SIGNAL */
 
-	uk_pr_debug("Process PID %d released\n",
-		    pprocess->pid);
+	pid = pprocess->pid;
+
+	pid_process[pid] = NULL;
 	uk_free(pprocess->_a, pprocess);
+
+	uk_pr_debug("pid %d released\n", pid);
 }
 
-static void pprocess_kill(struct posix_process *pprocess)
+static int posix_process_init(struct uk_init_ctx *ictx)
 {
-	struct posix_thread *pthread, *pthreadn, *pthread_self = NULL;
+	struct uk_thread *t;
 
-	/* Kill all remaining threads of the process */
-	uk_list_for_each_entry_safe(pthread, pthreadn,
-				    &pprocess->threads, thread_list_entry) {
-		/* Double-check that this thread is part of this process */
-		UK_ASSERT(pthread->process == pprocess);
+	UK_ASSERT(ictx);
 
-		if (pthread->thread == uk_thread_current()) {
-			/* Self-destruct this thread as last work of this
-			 * function. The reason is that nothing of this
-			 * function is executed anymore as soon as the
-			 * thread killed itself.
-			 */
-			pthread_self = pthread;
-			continue;
-		}
-		if (uk_thread_is_exited(pthread->thread)) {
-			/* Thread already exited, might wait for getting
-			 * garbage collected.
-			 */
-			continue;
-		}
-
-		uk_pr_debug("Terminating PID %d: Killing TID %d: thread %p (%s)...\n",
-			    pprocess->pid, pthread->tid,
-			    pthread->thread, pthread->thread->name);
-
-		/* Terminating the thread will lead to calling
-		 * `posix_thread_fini()` which will clean-up the related
-		 * pthread resources and pprocess resources on the last
-		 * thread
-		 */
-		uk_sched_thread_terminate(pthread->thread);
+	/* If ictx->tmain in set, main() executes on a
+	 * separate uk_thread. Instantiate PID_INIT from
+	 * that thread, and set pprocess_thread_main, as
+	 * we will need that information later.
+	 */
+	if (ictx->tmain) {
+		t = ictx->tmain;
+		pprocess_thread_main = ictx->tmain;
+	} else {
+		t = uk_thread_current();
 	}
 
-	if (pthread_self) {
-		uk_pr_debug("Terminating PID %d: Self-killing TID %d...\n",
-			    pprocess->pid, pthread_self->tid);
-		uk_sched_thread_terminate(uk_thread_current());
-
-		/* NOTE: Nothing will be executed from here on */
-	}
-}
-
-void uk_posix_process_kill(struct uk_thread *thread)
-{
-	struct posix_thread  **pthread;
-	struct posix_process *pprocess;
-
-	pthread = &uk_thread_uktls_var(thread, pthread_self);
-
-	UK_ASSERT(*pthread);
-	UK_ASSERT((*pthread)->process);
-
-	pprocess = (*pthread)->process;
-	pprocess_kill(pprocess);
-}
-
-#if CONFIG_LIBPOSIX_PROCESS_INIT_PIDS
-static int posix_process_init(struct uk_init_ctx *ictx __unused)
-{
 	/* Create a POSIX process without parent ("init" process) */
-	return uk_posix_process_create(uk_alloc_get_default(),
-				       uk_thread_current(), NULL);
+	return pprocess_create(uk_alloc_get_default(), t, NULL);
 }
 
 uk_late_initcall(posix_process_init, 0x0);
-#endif /* CONFIG_LIBPOSIX_PROCESS_INIT_PIDS */
-
-/* Thread initialization: Assign posix thread only if parent is part of a
- * process
- */
-static int posix_thread_init(struct uk_thread *child, struct uk_thread *parent)
-{
-	struct posix_thread *parent_pthread = NULL;
-	struct posix_thread *pthread;
-
-	if (parent) {
-		parent_pthread = uk_thread_uktls_var(parent,
-						     pthread_self);
-	}
-	if (!parent_pthread) {
-		/* parent has no posix thread, do not setup one for the child */
-		uk_pr_debug("thread %p (%s): Parent %p (%s) without process context, skipping...\n",
-			    child, child->name, parent,
-			    parent ? parent->name : "<n/a>");
-		pthread_self = NULL;
-		return 0;
-	}
-
-	UK_ASSERT(parent_pthread->process);
-
-	pthread = pprocess_create_pthread(parent_pthread->process,
-					  child);
-	if (PTRISERR(pthread))
-		return PTR2ERR(pthread);
-
-	pthread_self = pthread;
-
-	uk_pr_debug("thread %p (%s): New thread with TID: %d (PID: %d)\n",
-		    child, child->name, (int) pthread->tid,
-		    (int) pthread->process->pid);
-	return 0;
-}
 
 /* Thread release: Release TID and posix_thread */
-static void posix_thread_fini(struct uk_thread *child)
+static void posix_thread_fini(struct uk_thread *thread)
 {
 	struct posix_process *pprocess;
+	struct posix_thread *pthread;
 
-	if (!pthread_self)
-		return; /* no posix thread was assigned */
+	pthread = uk_thread_uktls_var(thread, pthread_self);
 
-	pprocess = pthread_self->process;
+	/* No pthread was ever assigned to this uk_thread,
+	 * or the pthread was already terminated as a result
+	 * to an exit syscall or a signal.
+	 *
+	 * If the pthread exists, this is its return path.
+	 */
+	if (!pthread)
+		return;
 
+	pprocess = pthread->process;
 	UK_ASSERT(pprocess);
 
-	uk_pr_debug("thread %p (%s): Releasing thread with TID: %d (PID: %d)\n",
-		    child, child->name, (int) pthread_self->tid,
-		    (int) pprocess->pid);
-	pprocess_release_pthread(pthread_self);
-	pthread_self = NULL;
+	/* Terminate and release thread */
+	pprocess_exit_pthread(pthread_self, POSIX_THREAD_EXITED, 0);
 
-	/* Release process if it became empty of threads */
-	if (uk_list_empty(&pprocess->threads))
-		pprocess_release(pprocess);
+	/* If last thread, also release the process */
+	if  (uk_list_empty(&pprocess->threads)) {
+		pprocess_exit(pprocess, POSIX_PROCESS_EXITED, 0);
+		/* UK_PID_INIT cannot be waited, release here */
+		if (pprocess->pid == UK_PID_INIT)
+			pprocess_release(pprocess);
+	}
 }
 
-UK_THREAD_INIT_PRIO(posix_thread_init, posix_thread_fini, UK_PRIO_EARLIEST);
+UK_THREAD_INIT_PRIO(0, posix_thread_fini, UK_PRIO_EARLIEST);
 
-static inline struct posix_thread *tid2pthread(pid_t tid)
+struct posix_process *pid2pprocess(pid_t pid)
+{
+	UK_ASSERT((__sz)pid < ARRAY_SIZE(pid_process));
+
+	return pid_process[pid];
+}
+
+struct posix_thread *tid2pthread(pid_t tid)
 {
 	if ((__sz)tid >= ARRAY_SIZE(tid_thread) || tid < 0)
 		return NULL;
 	return tid_thread[tid];
 }
 
-static inline struct posix_process *tid2pprocess(pid_t tid)
+struct posix_process *tid2pprocess(pid_t tid)
 {
 	struct posix_thread *pthread;
 
@@ -494,6 +572,8 @@ pid_t ukthread2tid(struct uk_thread *thread)
 {
 	struct posix_thread *pthread;
 
+	UK_ASSERT(thread);
+
 	pthread = uk_thread_uktls_var(thread, pthread_self);
 	if (!pthread)
 		return -ENOTSUP;
@@ -505,6 +585,8 @@ pid_t ukthread2pid(struct uk_thread *thread)
 {
 	struct posix_thread *pthread;
 
+	UK_ASSERT(thread);
+
 	pthread = uk_thread_uktls_var(thread, pthread_self);
 	if (!pthread)
 		return -ENOTSUP;
@@ -514,7 +596,7 @@ pid_t ukthread2pid(struct uk_thread *thread)
 	return pthread->process->pid;
 }
 
-UK_SYSCALL_R_DEFINE(pid_t, getpid)
+pid_t uk_sys_getpid(void)
 {
 	if (!pthread_self)
 		return -ENOTSUP;
@@ -523,7 +605,7 @@ UK_SYSCALL_R_DEFINE(pid_t, getpid)
 	return pthread_self->process->pid;
 }
 
-UK_SYSCALL_R_DEFINE(pid_t, gettid)
+pid_t uk_sys_gettid(void)
 {
 	if (!pthread_self)
 		return -ENOTSUP;
@@ -532,7 +614,7 @@ UK_SYSCALL_R_DEFINE(pid_t, gettid)
 }
 
 /* PID of parent process  */
-UK_SYSCALL_R_DEFINE(pid_t, getppid)
+pid_t uk_sys_getppid(void)
 {
 	if (!pthread_self)
 		return -ENOTSUP;
@@ -546,112 +628,40 @@ UK_SYSCALL_R_DEFINE(pid_t, getppid)
 
 	return pthread_self->process->parent->pid;
 }
-
- /* NOTE: The man pages of _exit(2) say:
-  *       "In glibc up to version 2.3, the _exit() wrapper function invoked
-  *        the kernel system call of the same name.  Since glibc 2.3, the
-  *        wrapper function invokes exit_group(2), in order to terminate all
-  *        of the threads in a process.
-  *        The raw _exit() system call terminates only the calling thread,
-  *        and actions such as reparenting child processes or sending
-  *        SIGCHLD to the parent process are performed only if this is the
-  *        last thread in the thread group."
-  */
-UK_LLSYSCALL_R_DEFINE(int, exit, int, status)
-{
-	uk_sched_thread_exit(); /* won't return */
-	UK_CRASH("sys_exit() unexpectedly returned\n");
-	return -EFAULT;
-}
-
-UK_LLSYSCALL_R_DEFINE(int, exit_group, int, status)
-{
-	uk_posix_process_kill(uk_thread_current()); /* won't return */
-	UK_CRASH("sys_exit_group() unexpectedly returned\n");
-	return -EFAULT;
-}
-
-#if UK_LIBC_SYSCALLS
-__noreturn void exit(int status)
-{
-	uk_syscall_r_exit_group(status);
-	UK_CRASH("sys_exit_group() unexpectedly returned\n");
-}
-
-__noreturn void exit_group(int status)
-{
-	uk_syscall_r_exit_group(status);
-	UK_CRASH("sys_exit_group() unexpectedly returned\n");
-}
-#endif /* UK_LIBC_SYSCALLS */
-
-#if CONFIG_LIBPOSIX_PROCESS_CLONE
-/* Store child PID at given location for parent */
-static int pprocess_parent_settid(const struct clone_args *cl_args,
-				  size_t cl_args_len __unused,
-				  struct uk_thread *child,
-				  struct uk_thread *parent __unused)
-{
-	pid_t child_tid = ukthread2tid(child);
-
-	UK_ASSERT(child_tid > 0);
-
-	if (!cl_args->parent_tid)
-		return -EINVAL;
-
-	*((pid_t *) cl_args->parent_tid) = child_tid;
-	return 0;
-}
-UK_POSIX_CLONE_HANDLER(CLONE_PARENT_SETTID, true, pprocess_parent_settid, 0x0);
-
-/* Store child PID at given location in child */
-static int pprocess_child_settid(const struct clone_args *cl_args,
-				 size_t cl_args_len __unused,
-				 struct uk_thread *child,
-				 struct uk_thread *parent __unused)
-{
-	pid_t child_tid = ukthread2tid(child);
-
-	UK_ASSERT(child_tid > 0);
-
-	if (!cl_args->child_tid)
-		return -EINVAL;
-
-	*((pid_t *) cl_args->child_tid) = child_tid;
-	return 0;
-}
-UK_POSIX_CLONE_HANDLER(CLONE_CHILD_SETTID, true, pprocess_child_settid, 0x0);
-
-static int pprocess_clone_thread(const struct clone_args *cl_args __unused,
-				 size_t cl_args_len __unused,
-				 struct uk_thread *child __unused,
-				 struct uk_thread *parent __unused)
-{
-	UK_WARN_STUBBED();
-
-	return 0;
-}
-UK_POSIX_CLONE_HANDLER(CLONE_THREAD, false, pprocess_clone_thread, 0x0);
-#endif /* CONFIG_LIBPOSIX_PROCESS_CLONE */
-#else  /* !CONFIG_LIBPOSIX_PROCESS_PIDS */
+#else  /* !CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
 
 #define UNIKRAFT_PID      1
 #define UNIKRAFT_TID      1
 #define UNIKRAFT_PPID     0
 
-UK_SYSCALL_R_DEFINE(int, getpid)
+pid_t uk_sys_getpid(void)
 {
 	return UNIKRAFT_PID;
 }
 
-UK_SYSCALL_R_DEFINE(int, gettid)
+pid_t uk_sys_gettid(void)
 {
 	return UNIKRAFT_TID;
 }
 
-UK_SYSCALL_R_DEFINE(pid_t, getppid)
+pid_t uk_sys_getppid(void)
 {
 	return UNIKRAFT_PPID;
 }
 
-#endif /* !CONFIG_LIBPOSIX_PROCESS_PIDS */
+#endif /* !CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
+
+UK_SYSCALL_R_DEFINE(pid_t, gettid)
+{
+	return uk_sys_gettid();
+}
+
+UK_SYSCALL_R_DEFINE(pid_t, getppid)
+{
+	return uk_sys_getppid();
+}
+
+UK_SYSCALL_R_DEFINE(pid_t, getpid)
+{
+	return uk_sys_getpid();
+}

@@ -64,7 +64,11 @@ extern "C" {
 #define PATH_MAX 4096
 #define NAME_MAX 255
 
+#define ARG_MAX 4096
+
 #define IOV_MAX 1024
+
+#define _POSIX_SIGQUEUE_MAX	32
 
 #ifdef __cplusplus
 }

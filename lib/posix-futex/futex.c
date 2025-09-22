@@ -51,9 +51,9 @@
 #include <uk/thread.h>
 #include <uk/thread.h>
 #include <uk/list.h>
-#if CONFIG_LIBPOSIX_PROCESS_CLONE
+#if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING
 #include <uk/process.h>
-#endif /* CONFIG_LIBPOSIX_PROCESS_CLONE */
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
 #include <uk/sched.h>
 #include <uk/list.h>
 #include <uk/assert.h>
@@ -345,7 +345,7 @@ UK_LLSYSCALL_R_DEFINE(int, futex, uint32_t *, uaddr, int, futex_op,
 	}
 }
 
-#if CONFIG_LIBPOSIX_PROCESS_CLONE
+#if CONFIG_LIBPOSIX_PROCESS_MULTITHREADING
 /*
  * Reference to child TID that should be cleared on thread exit
  * (if not NULL):
@@ -354,15 +354,31 @@ UK_LLSYSCALL_R_DEFINE(int, futex, uint32_t *, uaddr, int, futex_op,
 static __uk_tls pid_t *child_tid_clear_ref = NULL;
 
 /* Store reference for clearing child TID on exit */
-static int pfutex_child_cleartid(const struct clone_args *cl_args,
-				 size_t cl_args_len __unused,
-				 struct uk_thread *child __unused,
-				 struct uk_thread *parent __unused)
+static int pfutex_child_cleartid(void *arg)
 {
-	child_tid_clear_ref = (pid_t *) cl_args->child_tid;
-	return 0;
+	struct posix_process_clone_event_data *event_data;
+	const struct clone_args *cl_args;
+	struct uk_thread *child;
+	pid_t *child_tid;
+
+	event_data = (struct posix_process_clone_event_data *)arg;
+	UK_ASSERT(event_data);
+
+	cl_args = event_data->cl_args;
+	UK_ASSERT(cl_args);
+
+	if (!(cl_args->flags & CLONE_CHILD_CLEARTID))
+		return UK_EVENT_NOT_HANDLED;
+
+	child_tid = (pid_t *)cl_args->child_tid;
+	child = event_data->child;
+
+	uk_thread_uktls_var(child, child_tid_clear_ref) = child_tid;
+
+	return UK_EVENT_HANDLED_CONT;
 }
-UK_POSIX_CLONE_HANDLER(CLONE_CHILD_CLEARTID, true, pfutex_child_cleartid, 0x0);
+
+POSIX_PROCESS_CLONE_HANDLER(CLONE_CHILD_CLEARTID, pfutex_child_cleartid);
 
 /* Update the stored reference for clearing child TID on exit
  * NOTE: There is no libc wrapper
@@ -373,7 +389,7 @@ UK_POSIX_CLONE_HANDLER(CLONE_CHILD_CLEARTID, true, pfutex_child_cleartid, 0x0);
  */
 UK_LLSYSCALL_R_DEFINE(pid_t, set_tid_address, pid_t *, tid_ref)
 {
-	pid_t self_tid = uk_syscall_r_gettid();
+	pid_t self_tid = uk_sys_gettid();
 
 	if (self_tid >= 0) {
 		/* Store new reference */
@@ -407,4 +423,4 @@ static void thread_exit_handler(struct uk_thread *child)
 
 UK_THREAD_INIT_PRIO(0x0, thread_exit_handler, UK_PRIO_EARLIEST);
 
-#endif /* CONFIG_LIBPOSIX_PROCESS_CLONE */
+#endif /* CONFIG_LIBPOSIX_PROCESS_MULTITHREADING */
